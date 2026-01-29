@@ -1,10 +1,13 @@
 """MCP Server for Telegram Bot API integration using FastMCP."""
 
+import argparse
 import asyncio
 import json
 import logging
 import os
+import signal
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -762,6 +765,161 @@ async def telegram_get_queued_messages(
         )
 
 
+# Global state for background services
+_polling_thread: threading.Thread | None = None
+_bridge_thread: threading.Thread | None = None
+_shutdown_event = threading.Event()
+
+
+def run_polling_service():
+    """Run the polling service in a background thread."""
+    from telegram_polling_service.polling_service import TelegramPollingService
+    
+    async def async_polling():
+        service = TelegramPollingService()
+        service.running = True
+        
+        logger.info("Background polling service started")
+        try:
+            while not _shutdown_event.is_set():
+                await service.poll_once()
+                # Check shutdown more frequently
+                for _ in range(10):
+                    if _shutdown_event.is_set():
+                        break
+                    await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"Polling service error: {e}")
+        finally:
+            await service.client.close()
+            service._save_processed_ids()
+            logger.info("Background polling service stopped")
+    
+    # Create a new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(async_polling())
+    finally:
+        loop.close()
+
+
+def run_bridge_service(
+    opencode_url: str,
+    reply_to_telegram: bool,
+    provider_id: str,
+    model_id: str,
+):
+    """Run the bridge service in a background thread."""
+    from telegram_bridge.bridge_service import TelegramOpenCodeBridge
+    
+    async def async_bridge():
+        settings = get_settings()
+        bridge = TelegramOpenCodeBridge(
+            opencode_url=opencode_url,
+            queue_dir=settings.queue_dir,
+            poll_interval=2,
+            reply_to_telegram=reply_to_telegram,
+            bot_token=settings.bot_token,
+            provider_id=provider_id,
+            model_id=model_id,
+        )
+        bridge.running = True
+        
+        logger.info(f"Background bridge service started (OpenCode: {opencode_url})")
+        
+        # Wait for OpenCode to be available
+        retry_count = 0
+        max_retries = 30  # Wait up to 60 seconds
+        while not _shutdown_event.is_set() and retry_count < max_retries:
+            if await bridge.opencode.health_check():
+                logger.info("Connected to OpenCode server")
+                break
+            retry_count += 1
+            logger.debug(f"Waiting for OpenCode server... ({retry_count}/{max_retries})")
+            await asyncio.sleep(2)
+        else:
+            if _shutdown_event.is_set():
+                return
+            logger.warning(f"Could not connect to OpenCode at {opencode_url}, bridge will retry")
+        
+        try:
+            while not _shutdown_event.is_set():
+                try:
+                    await bridge.process_queue()
+                except Exception as e:
+                    logger.error(f"Bridge process error: {e}")
+                await asyncio.sleep(bridge.poll_interval)
+        except Exception as e:
+            logger.error(f"Bridge service error: {e}")
+        finally:
+            await bridge.opencode.close()
+            if bridge.telegram:
+                await bridge.telegram.close()
+            bridge._save_forwarded_ids()
+            logger.info("Background bridge service stopped")
+    
+    # Create a new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(async_bridge())
+    finally:
+        loop.close()
+
+
+def start_background_services(
+    enable_polling: bool = False,
+    enable_bridge: bool = False,
+    opencode_url: str = "http://localhost:4096",
+    reply_to_telegram: bool = True,
+    provider_id: str = "github-copilot",
+    model_id: str = "claude-opus-4.5",
+):
+    """Start background services in daemon threads."""
+    global _polling_thread, _bridge_thread
+    
+    _shutdown_event.clear()
+    
+    if enable_polling:
+        _polling_thread = threading.Thread(
+            target=run_polling_service,
+            daemon=True,
+            name="telegram-polling",
+        )
+        _polling_thread.start()
+        logger.info("Started background polling thread")
+    
+    if enable_bridge:
+        _bridge_thread = threading.Thread(
+            target=run_bridge_service,
+            args=(opencode_url, reply_to_telegram, provider_id, model_id),
+            daemon=True,
+            name="telegram-bridge",
+        )
+        _bridge_thread.start()
+        logger.info("Started background bridge thread")
+
+
+def stop_background_services():
+    """Stop background services gracefully."""
+    global _polling_thread, _bridge_thread
+    
+    logger.info("Stopping background services...")
+    _shutdown_event.set()
+    
+    if _polling_thread and _polling_thread.is_alive():
+        _polling_thread.join(timeout=5)
+        logger.info("Polling thread stopped")
+    
+    if _bridge_thread and _bridge_thread.is_alive():
+        _bridge_thread.join(timeout=5)
+        logger.info("Bridge thread stopped")
+    
+    _polling_thread = None
+    _bridge_thread = None
+
+
 def run_server():
     """Run the MCP server."""
     # Ensure queue directory exists
@@ -775,15 +933,114 @@ def run_server():
 def cleanup_resources():
     """Clean up global resources."""
     global _telegram_client
+    
+    # Stop background services
+    stop_background_services()
+    
     if _telegram_client:
         # Run async cleanup in a new event loop
-        asyncio.run(_telegram_client.close())
+        try:
+            asyncio.run(_telegram_client.close())
+        except Exception:
+            pass
         _telegram_client = None
+
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Telegram MCP Server with integrated polling and bridge services",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run MCP server only (default)
+  telegram-mcp-server
+
+  # Run with background polling (captures messages when idle)
+  telegram-mcp-server --enable-polling
+
+  # Run with polling and bridge (full two-way Telegram integration)
+  telegram-mcp-server --enable-polling --enable-bridge
+
+  # Specify OpenCode URL for bridge
+  telegram-mcp-server --enable-polling --enable-bridge --opencode-url http://localhost:8080
+
+Environment variables:
+  TELEGRAM_BOT_TOKEN   - Bot token (required)
+  TELEGRAM_CHAT_ID     - Default chat ID (required)
+  TELEGRAM_QUEUE_DIR   - Queue directory (default: ~/.local/share/telegram_mcp_server)
+        """,
+    )
+    parser.add_argument(
+        "--enable-polling",
+        action="store_true",
+        default=os.environ.get("TELEGRAM_ENABLE_POLLING", "").lower() in ("true", "1", "yes"),
+        help="Enable background polling service to capture messages",
+    )
+    parser.add_argument(
+        "--enable-bridge",
+        action="store_true",
+        default=os.environ.get("TELEGRAM_ENABLE_BRIDGE", "").lower() in ("true", "1", "yes"),
+        help="Enable bridge service to forward messages to OpenCode",
+    )
+    parser.add_argument(
+        "--opencode-url",
+        default=os.environ.get("TELEGRAM_OPENCODE_URL", "http://localhost:4096"),
+        help="OpenCode HTTP API URL (default: http://localhost:4096)",
+    )
+    parser.add_argument(
+        "--no-reply",
+        action="store_true",
+        default=os.environ.get("TELEGRAM_NO_REPLY", "").lower() in ("true", "1", "yes"),
+        help="Disable sending OpenCode responses back to Telegram",
+    )
+    parser.add_argument(
+        "--provider",
+        default=os.environ.get("TELEGRAM_PROVIDER", "github-copilot"),
+        help="OpenCode provider ID (default: github-copilot)",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("TELEGRAM_MODEL", "claude-opus-4.5"),
+        help="OpenCode model ID (default: claude-opus-4.5)",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose logging",
+    )
+    
+    return parser.parse_args()
 
 
 def main():
     """Main entry point."""
+    args = parse_args()
+    
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Log configuration
+    if args.enable_polling or args.enable_bridge:
+        logger.info("Telegram MCP Server starting with integrated services")
+        if args.enable_polling:
+            logger.info("  - Background polling: ENABLED")
+        if args.enable_bridge:
+            logger.info(f"  - Bridge to OpenCode: ENABLED ({args.opencode_url})")
+            logger.info(f"  - Reply to Telegram: {'DISABLED' if args.no_reply else 'ENABLED'}")
+            logger.info(f"  - Model: {args.provider}/{args.model}")
+    
     try:
+        # Start background services before MCP server
+        start_background_services(
+            enable_polling=args.enable_polling,
+            enable_bridge=args.enable_bridge,
+            opencode_url=args.opencode_url,
+            reply_to_telegram=not args.no_reply,
+            provider_id=args.provider,
+            model_id=args.model,
+        )
+        
         run_server()
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt, shutting down...")

@@ -13,7 +13,9 @@ An MCP (Model Context Protocol) server that connects to the Telegram Bot API, al
 - **Receive Messages**: Poll for new messages and commands from Telegram
 - **Reactions & Polls**: Add emoji reactions, create polls
 - **Chat Info**: Get chat details, member info, member counts
-- **Background Polling**: Separate polling service captures messages when the MCP server isn't running
+- **Integrated Services**: Built-in polling and OpenCode bridge - no separate processes needed!
+- **Background Polling**: Captures messages even when the AI agent isn't actively listening
+- **Two-Way Bridge**: Forwards Telegram messages to OpenCode and sends responses back
 - **Message Watcher Plugin**: OpenCode plugin that notifies when new messages arrive
 - **Retry Logic**: Automatic retry with exponential backoff for rate limits and network errors
 - **Input Validation**: Robust validation of chat IDs, user IDs, and usernames
@@ -61,6 +63,7 @@ cp .env.example .env
 
 #### OpenCode (`~/.config/opencode/config.toml`)
 
+**Basic Setup (MCP server only):**
 ```toml
 [mcp.servers.telegram]
 command = "/path/to/telegram_mcp_server/.venv/bin/telegram-mcp-server"
@@ -69,6 +72,21 @@ command = "/path/to/telegram_mcp_server/.venv/bin/telegram-mcp-server"
 TELEGRAM_BOT_TOKEN = "your_bot_token_here"
 TELEGRAM_CHAT_ID = "your_chat_id_here"
 ```
+
+**Full Integration (with polling and bridge):**
+```toml
+[mcp.servers.telegram]
+command = "/path/to/telegram_mcp_server/.venv/bin/telegram-mcp-server"
+args = ["--enable-polling", "--enable-bridge"]
+
+[mcp.servers.telegram.env]
+TELEGRAM_BOT_TOKEN = "your_bot_token_here"
+TELEGRAM_CHAT_ID = "your_chat_id_here"
+```
+
+This enables:
+- **Polling**: Automatically captures incoming Telegram messages in background
+- **Bridge**: Forwards messages to OpenCode and sends AI responses back to Telegram
 
 #### Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`)
 
@@ -171,12 +189,46 @@ telegram_send_reaction(
 
 ## Background Polling Service
 
-The polling service runs separately to capture messages even when the MCP server isn't running.
+The MCP server now has **integrated polling and bridge services**. You can enable them with command-line flags:
 
-### Run Manually
+### Integrated Mode (Recommended)
 
 ```bash
+# Enable polling only (captures messages in background)
+telegram-mcp-server --enable-polling
+
+# Enable both polling and bridge (full two-way communication)
+telegram-mcp-server --enable-polling --enable-bridge
+
+# With custom OpenCode URL
+telegram-mcp-server --enable-polling --enable-bridge --opencode-url http://localhost:8080
+
+# Disable replies (one-way: Telegram -> OpenCode only)
+telegram-mcp-server --enable-polling --enable-bridge --no-reply
+```
+
+### CLI Options
+
+| Option | Environment Variable | Default | Description |
+|--------|---------------------|---------|-------------|
+| `--enable-polling` | `TELEGRAM_ENABLE_POLLING` | false | Enable background message polling |
+| `--enable-bridge` | `TELEGRAM_ENABLE_BRIDGE` | false | Enable OpenCode bridge |
+| `--opencode-url` | `TELEGRAM_OPENCODE_URL` | `http://localhost:4096` | OpenCode HTTP API URL |
+| `--no-reply` | `TELEGRAM_NO_REPLY` | false | Disable sending responses back |
+| `--provider` | `TELEGRAM_PROVIDER` | `github-copilot` | AI provider ID |
+| `--model` | `TELEGRAM_MODEL` | `claude-opus-4.5` | AI model ID |
+| `--verbose` | - | false | Enable debug logging |
+
+### Standalone Mode (Legacy)
+
+You can still run the services separately if needed:
+
+```bash
+# Run polling service standalone
 telegram-mcp-polling
+
+# Run bridge service standalone  
+telegram-opencode-bridge --opencode-url http://localhost:4096 --reply
 ```
 
 ### Run as Systemd Service
@@ -273,6 +325,12 @@ docker compose up -d
 | `TELEGRAM_API_BASE_URL` | No | `https://api.telegram.org` | Custom API endpoint |
 | `TELEGRAM_POLLING_TIMEOUT` | No | `30` | Long polling timeout (seconds) |
 | `TELEGRAM_QUEUE_DIR` | No | `~/.local/share/telegram_mcp_server` | Queue file directory |
+| `TELEGRAM_ENABLE_POLLING` | No | `false` | Enable integrated polling |
+| `TELEGRAM_ENABLE_BRIDGE` | No | `false` | Enable integrated bridge |
+| `TELEGRAM_OPENCODE_URL` | No | `http://localhost:4096` | OpenCode HTTP API URL |
+| `TELEGRAM_NO_REPLY` | No | `false` | Disable sending replies to Telegram |
+| `TELEGRAM_PROVIDER` | No | `github-copilot` | AI provider for bridge |
+| `TELEGRAM_MODEL` | No | `claude-opus-4.5` | AI model for bridge |
 
 ---
 
@@ -304,14 +362,17 @@ telegram_mcp_server/
 ├── src/
 │   ├── telegram_mcp_server/
 │   │   ├── __init__.py
-│   │   ├── server.py          # FastMCP server with all tools
+│   │   ├── server.py          # FastMCP server with integrated services
 │   │   ├── telegram_client.py # Telegram Bot API client with retry
 │   │   ├── config.py          # Pydantic settings
 │   │   ├── errors.py          # Error handling utilities
 │   │   └── validation.py      # Input validation decorators
-│   └── telegram_polling_service/
+│   ├── telegram_polling_service/
+│   │   ├── __init__.py
+│   │   └── polling_service.py # Background message polling
+│   └── telegram_bridge/
 │       ├── __init__.py
-│       └── polling_service.py # Background message polling
+│       └── bridge_service.py  # OpenCode bridge service
 ├── opencode-plugins/
 │   └── telegram-watcher.ts    # OpenCode notification plugin
 ├── tests/
