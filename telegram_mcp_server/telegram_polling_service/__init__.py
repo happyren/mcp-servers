@@ -1,1 +1,0 @@
-"""Telegram polling service for continuous message collection."""

@@ -1,21 +1,24 @@
-"""MCP Server for Telegram Bot API integration."""
+"""MCP Server for Telegram Bot API integration using FastMCP."""
 
 import asyncio
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import (
-    Tool,
-    TextContent,
-)
+from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from .config import get_settings, Settings
-from .telegram_client import TelegramClient, TelegramMessage
+from .errors import ErrorCategory, format_telegram_error, log_and_format_error
+from .telegram_client import TelegramClient
+from .validation import (
+    validate_id,
+    validate_message_text,
+    validate_parse_mode,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -24,10 +27,16 @@ logger = logging.getLogger(__name__)
 # Global state
 _telegram_client: TelegramClient | None = None
 _settings: Settings | None = None
-_pending_messages: list[TelegramMessage] = []
 
-# Queue file path for polling service
-QUEUE_FILE_PATH = Path.home() / ".local" / "share" / "telegram_mcp_server" / "message_queue.json"
+
+def get_queue_file_path() -> Path:
+    """Get queue file path from settings."""
+    settings = get_settings()
+    queue_dir = Path(settings.queue_dir).expanduser()
+    return queue_dir / "message_queue.json"
+
+
+QUEUE_FILE_PATH = get_queue_file_path()
 
 
 def get_client() -> TelegramClient:
@@ -36,7 +45,7 @@ def get_client() -> TelegramClient:
     if _telegram_client is None:
         _settings = get_settings()
         _telegram_client = TelegramClient(
-             bot_token=_settings.bot_token,
+            bot_token=_settings.bot_token,
             base_url=_settings.api_base_url,
         )
     return _telegram_client
@@ -51,334 +60,735 @@ def get_default_chat_id() -> str:
 
 
 def get_queued_messages(clear_after_read: bool = False) -> list[dict[str, Any]]:
-    """Get messages from the polling service queue file.
-    
+    """Get messages from polling service queue file.
+
     Args:
         clear_after_read: If True, clear the queue file after reading.
-        
+
     Returns:
         List of queued messages as dictionaries.
     """
-    if not QUEUE_FILE_PATH.exists():
+    queue_path = get_queue_file_path()
+
+    if not queue_path.exists():
         return []
-    
+
     try:
-        with open(QUEUE_FILE_PATH, 'r', encoding='utf-8') as f:
+        with open(queue_path, "r", encoding="utf-8") as f:
             messages = json.load(f)
     except (json.JSONDecodeError, FileNotFoundError):
         messages = []
-    
+
     if clear_after_read and messages:
         try:
-            QUEUE_FILE_PATH.unlink()
+            queue_path.unlink()
         except OSError:
-            # If we can't delete, at least clear the file
-            with open(QUEUE_FILE_PATH, 'w', encoding='utf-8') as f:
-                f.write('[]')
-    
+            with open(queue_path, "w", encoding="utf-8") as f:
+                f.write("[]")
+
     return messages
 
 
-# Create the MCP server
-server = Server("telegram-mcp-server")
+# Create the MCP server with FastMCP
+mcp = FastMCP("telegram-mcp-server")
 
 
-@server.list_tools()
-async def list_tools() -> list[Tool]:
-    """List available Telegram tools."""
-    return [
-        Tool(
-            name="telegram_send_message",
-            description="Send a message to a Telegram chat. Use this to send summaries, status updates, or any text to your Telegram account.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "The message text to send. Supports Markdown formatting.",
-                    },
-                    "chat_id": {
-                        "type": "string",
-                        "description": "Optional chat ID to send to. If not provided, uses the default configured chat ID.",
-                    },
-                    "parse_mode": {
-                        "type": "string",
-                        "enum": ["Markdown", "HTML", "None"],
-                        "description": "Parse mode for the message. Defaults to Markdown.",
-                    },
-                },
-                "required": ["message"],
-            },
-        ),
-        Tool(
-            name="telegram_send_summary",
-            description="Send a work summary to Telegram. Formats the summary nicely with a header.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Title for the summary (e.g., 'Task Completed', 'Build Status').",
-                    },
-                    "summary": {
-                        "type": "string",
-                        "description": "The summary content. Can include bullet points and details.",
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": ["success", "warning", "error", "info"],
-                        "description": "Status indicator for the summary. Defaults to 'info'.",
-                    },
-                    "chat_id": {
-                        "type": "string",
-                        "description": "Optional chat ID. Uses default if not provided.",
-                    },
-                },
-                "required": ["title", "summary"],
-            },
-        ),
-        Tool(
-            name="telegram_receive_messages",
-            description="Check for and receive new messages from Telegram. Use this to get commands or instructions sent to the bot.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "timeout": {
-                        "type": "integer",
-                        "description": "Timeout in seconds for long polling. Defaults to 5 seconds for quick checks.",
-                        "default": 5,
-                    },
-                    "from_user_id": {
-                        "type": "string",
-                        "description": "Optional: Only return messages from this user ID.",
-                    },
-                },
-                "required": [],
-            },
-        ),
-        Tool(
-            name="telegram_reply_message",
-            description="Reply to a specific Telegram message.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "chat_id": {
-                        "type": "string",
-                        "description": "The chat ID where the original message was sent.",
-                    },
-                    "message_id": {
-                        "type": "integer",
-                        "description": "The ID of the message to reply to.",
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "The reply text.",
-                    },
-                },
-                "required": ["chat_id", "message_id", "text"],
-            },
-        ),
-        Tool(
-            name="telegram_get_bot_info",
-            description="Get information about the Telegram bot.",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        ),
-        Tool(
-            name="telegram_get_queued_messages",
-            description="Get messages from the polling service queue. Use this to retrieve commands sent while OpenCode wasn't running.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "clear_after_read": {
-                        "type": "boolean",
-                        "description": "Clear the queue after reading messages (default: false).",
-                        "default": False,
-                    },
-                },
-                "required": [],
-            },
-        ),
-    ]
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Send Message", destructiveHint=True, openWorldHint=True
+    )
+)
+@validate_id("chat_id")
+async def telegram_send_message(
+    chat_id: str,
+    message: str,
+    parse_mode: str = "Markdown",
+) -> str:
+    """Send a message to a Telegram chat.
 
+    Args:
+        chat_id: The chat ID to send to (integer or username).
+        message: The message text to send. Supports Markdown formatting.
+        parse_mode: Format mode: Markdown, HTML, or None. Defaults to Markdown.
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    """Handle tool calls."""
-    client = get_client()
-
+    Returns:
+        Success message with message ID and chat ID.
+    """
     try:
-        if name == "telegram_send_message":
-            message = arguments["message"]
-            chat_id = arguments.get("chat_id", get_default_chat_id())
-            parse_mode = arguments.get("parse_mode", "Markdown")
-            if parse_mode == "None":
-                parse_mode = None
+        validated_text, text_error = validate_message_text(message)
+        if text_error:
+            return text_error
 
-            result = await client.send_message(
-                chat_id=chat_id,
-                text=message,
-                parse_mode=parse_mode,
-            )
+        validated_parse_mode, parse_error = validate_parse_mode(parse_mode)
+        if parse_error:
+            return parse_error
 
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Message sent successfully!\nMessage ID: {result.get('message_id')}\nChat ID: {result.get('chat', {}).get('id')}",
-                )
-            ]
+        client = get_client()
+        result = await client.send_message(
+            chat_id=chat_id,
+            text=validated_text,
+            parse_mode=validated_parse_mode,
+        )
 
-        elif name == "telegram_send_summary":
-            title = arguments["title"]
-            summary = arguments["summary"]
-            status = arguments.get("status", "info")
-            chat_id = arguments.get("chat_id", get_default_chat_id())
-
-            # Status emoji mapping
-            status_emoji = {
-                "success": "✅",
-                "warning": "⚠️",
-                "error": "❌",
-                "info": "ℹ️",
-            }
-
-            emoji = status_emoji.get(status, "ℹ️")
-            formatted_message = f"{emoji} *{title}*\n\n{summary}"
-
-            result = await client.send_message(
-                chat_id=chat_id,
-                text=formatted_message,
-                parse_mode="Markdown",
-            )
-
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Summary sent successfully!\nMessage ID: {result.get('message_id')}",
-                )
-            ]
-
-        elif name == "telegram_receive_messages":
-            timeout = arguments.get("timeout", 5)
-            from_user_id = arguments.get("from_user_id")
-
-            messages = await client.get_new_messages(timeout=timeout)
-
-            # Filter by user ID if specified
-            if from_user_id:
-                from_user_id_int = int(from_user_id)
-                messages = [m for m in messages if m.from_user_id == from_user_id_int]
-
-            if not messages:
-                return [
-                    TextContent(
-                        type="text",
-                        text="No new messages received.",
-                    )
-                ]
-
-            # Format messages for output
-            formatted = []
-            for msg in messages:
-                formatted.append(
-                    {
-                        "message_id": msg.message_id,
-                        "chat_id": msg.chat_id,
-                        "from_user_id": msg.from_user_id,
-                        "from_username": msg.from_username,
-                        "text": msg.text,
-                        "date": msg.date,
-                    }
-                )
-
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Received {len(messages)} new message(s):\n\n{json.dumps(formatted, indent=2)}",
-                )
-            ]
-
-        elif name == "telegram_reply_message":
-            chat_id = arguments["chat_id"]
-            message_id = arguments["message_id"]
-            text = arguments["text"]
-
-            result = await client.reply_to_message(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-            )
-
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Reply sent successfully!\nMessage ID: {result.get('message_id')}",
-                )
-            ]
-
-        elif name == "telegram_get_queued_messages":
-            clear_after_read = arguments.get("clear_after_read", False)
-            messages = get_queued_messages(clear_after_read=clear_after_read)
-            
-            if not messages:
-                return [
-                    TextContent(
-                        type="text",
-                        text="No queued messages found.",
-                    )
-                ]
-            
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Found {len(messages)} queued message(s):\n\n{json.dumps(messages, indent=2)}",
-                )
-            ]
-
-        elif name == "telegram_get_bot_info":
-            bot_info = await client.get_me()
-
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Bot Information:\n{json.dumps(bot_info, indent=2)}",
-                )
-            ]
-
-        else:
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Unknown tool: {name}",
-                )
-            ]
-
+        return f"Message sent successfully!\nMessage ID: {result.get('message_id')}\nChat ID: {result.get('chat', {}).get('id')}"
     except Exception as e:
-        logger.error(f"Error calling tool {name}: {e}")
-        return [
-            TextContent(
-                type="text",
-                text=f"Error: {str(e)}",
+        return log_and_format_error(
+            "telegram_send_message",
+            e,
+            category=ErrorCategory.MSG,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Send Summary", destructiveHint=True, openWorldHint=True)
+)
+@validate_id("chat_id")
+async def telegram_send_summary(
+    title: str,
+    summary: str,
+    status: str = "info",
+    chat_id: str | None = None,
+) -> str:
+    """Send a work summary to Telegram with formatted header.
+
+    Args:
+        title: Title for the summary (e.g., 'Task Completed', 'Build Status').
+        summary: The summary content. Can include bullet points and details.
+        status: Status indicator: success, warning, error, or info. Defaults to info.
+        chat_id: Optional chat ID. Uses default if not provided.
+
+    Returns:
+        Success message with message ID.
+    """
+    try:
+        if chat_id is None:
+            chat_id = get_default_chat_id()
+
+        status_emoji = {
+            "success": "✅",
+            "warning": "⚠️",
+            "error": "❌",
+            "info": "ℹ️",
+        }
+
+        emoji = status_emoji.get(status, "ℹ️")
+        formatted_message = f"{emoji} *{title}*\n\n{summary}"
+
+        client = get_client()
+        result = await client.send_message(
+            chat_id=chat_id,
+            text=formatted_message,
+            parse_mode="Markdown",
+        )
+
+        return f"Summary sent successfully!\nMessage ID: {result.get('message_id')}"
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_send_summary",
+            e,
+            category=ErrorCategory.MSG,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id or get_default_chat_id(),
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Receive Messages", readOnlyHint=True, openWorldHint=True)
+)
+async def telegram_receive_messages(
+    timeout: int = 5,
+    from_user_id: str | None = None,
+) -> str:
+    """Check for and receive new messages from Telegram.
+
+    Args:
+        timeout: Timeout in seconds for long polling. Defaults to 5 seconds.
+        from_user_id: Optional user ID to filter messages from.
+
+    Returns:
+        JSON-formatted list of new messages or message indicating no new messages.
+    """
+    try:
+        client = get_client()
+        messages = await client.get_new_messages(timeout=timeout)
+
+        if from_user_id:
+            from_user_id_int = int(from_user_id)
+            messages = [m for m in messages if m.from_user_id == from_user_id_int]
+
+        if not messages:
+            return "No new messages received."
+
+        formatted = []
+        for msg in messages:
+            formatted.append(
+                {
+                    "message_id": msg.message_id,
+                    "chat_id": msg.chat_id,
+                    "from_user_id": msg.from_user_id,
+                    "from_username": msg.from_username,
+                    "text": msg.text,
+                    "date": msg.date,
+                }
             )
-        ]
+
+        return json.dumps(formatted, indent=2)
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_receive_messages",
+            e,
+            category=ErrorCategory.MSG,
+            user_message=format_telegram_error(e),
+            timeout=timeout,
+            from_user_id=from_user_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Reply Message", destructiveHint=True, openWorldHint=True)
+)
+@validate_id("chat_id")
+async def telegram_reply_message(
+    chat_id: str,
+    message_id: int,
+    text: str,
+) -> str:
+    """Reply to a specific Telegram message.
+
+    Args:
+        chat_id: The chat ID where the original message was sent.
+        message_id: The ID of the message to reply to.
+        text: The reply text.
+
+    Returns:
+        Success message with message ID.
+    """
+    try:
+        validated_text, text_error = validate_message_text(text)
+        if text_error:
+            return text_error
+
+        client = get_client()
+        result = await client.reply_to_message(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=validated_text,
+        )
+
+        return f"Reply sent successfully!\nMessage ID: {result.get('message_id')}"
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_reply_message",
+            e,
+            category=ErrorCategory.MSG,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Edit Message", destructiveHint=True, openWorldHint=True)
+)
+@validate_id("chat_id")
+async def telegram_edit_message(
+    chat_id: str,
+    message_id: int,
+    new_text: str,
+) -> str:
+    """Edit a previously sent message.
+
+    Args:
+        chat_id: The chat ID containing the message.
+        message_id: The ID of the message to edit.
+        new_text: The new message text.
+
+    Returns:
+        Success message with message ID.
+    """
+    try:
+        validated_text, text_error = validate_message_text(new_text)
+        if text_error:
+            return text_error
+
+        client = get_client()
+        result = await client.edit_message(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=validated_text,
+        )
+
+        return f"Message edited successfully!\nMessage ID: {result.get('message_id')}"
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_edit_message",
+            e,
+            category=ErrorCategory.MSG,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Delete Message", destructiveHint=True, openWorldHint=True)
+)
+@validate_id("chat_id")
+async def telegram_delete_message(
+    chat_id: str,
+    message_id: int,
+) -> str:
+    """Delete a message from a chat.
+
+    Args:
+        chat_id: The chat ID containing the message.
+        message_id: The ID of the message to delete.
+
+    Returns:
+        Success message.
+    """
+    try:
+        client = get_client()
+        await client.delete_message(
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+
+        return "Message deleted successfully!"
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_delete_message",
+            e,
+            category=ErrorCategory.MSG,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Forward Message", destructiveHint=True, openWorldHint=True)
+)
+@validate_id("chat_id", "from_chat_id")
+async def telegram_forward_message(
+    chat_id: str,
+    from_chat_id: str,
+    message_id: int,
+) -> str:
+    """Forward a message to another chat.
+
+    Args:
+        chat_id: Target chat ID to forward to.
+        from_chat_id: Source chat ID containing the message.
+        message_id: The ID of the message to forward.
+
+    Returns:
+        Success message with new message ID.
+    """
+    try:
+        client = get_client()
+        result = await client.forward_message(
+            chat_id=chat_id,
+            from_chat_id=from_chat_id,
+            message_id=message_id,
+        )
+
+        return f"Message forwarded successfully!\nMessage ID: {result.get('message_id')}"
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_forward_message",
+            e,
+            category=ErrorCategory.MSG,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id,
+            from_chat_id=from_chat_id,
+            message_id=message_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Pin Message", destructiveHint=True, openWorldHint=True)
+)
+@validate_id("chat_id")
+async def telegram_pin_message(
+    chat_id: str,
+    message_id: int,
+    disable_notification: bool = False,
+) -> str:
+    """Pin a message in a chat.
+
+    Args:
+        chat_id: The chat ID.
+        message_id: The ID of the message to pin.
+        disable_notification: Send silently without notification. Defaults to False.
+
+    Returns:
+        Success message.
+    """
+    try:
+        client = get_client()
+        await client.pin_message(
+            chat_id=chat_id,
+            message_id=message_id,
+            disable_notification=disable_notification,
+        )
+
+        return "Message pinned successfully!"
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_pin_message",
+            e,
+            category=ErrorCategory.MSG,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Unpin Message", destructiveHint=True, openWorldHint=True)
+)
+@validate_id("chat_id")
+async def telegram_unpin_message(
+    chat_id: str,
+    message_id: int,
+) -> str:
+    """Unpin a message from a chat.
+
+    Args:
+        chat_id: The chat ID.
+        message_id: The ID of the message to unpin.
+
+    Returns:
+        Success message.
+    """
+    try:
+        client = get_client()
+        await client.unpin_message(
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+
+        return "Message unpinned successfully!"
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_unpin_message",
+            e,
+            category=ErrorCategory.MSG,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Send Reaction", destructiveHint=True, openWorldHint=True)
+)
+@validate_id("chat_id")
+async def telegram_send_reaction(
+    chat_id: str,
+    message_id: int,
+    emoji: str,
+) -> str:
+    """Add a reaction emoji to a message.
+
+    Args:
+        chat_id: The chat ID.
+        message_id: The ID of the message to react to.
+        emoji: The emoji reaction (e.g., 👍, ❤️, 😂).
+
+    Returns:
+        Success message.
+    """
+    try:
+        client = get_client()
+        await client.send_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            emoji=emoji,
+        )
+
+        return f"Reaction '{emoji}' added successfully!"
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_send_reaction",
+            e,
+            category=ErrorCategory.MSG,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id,
+            message_id=message_id,
+            emoji=emoji,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Send Poll", destructiveHint=True, openWorldHint=True)
+)
+@validate_id("chat_id")
+async def telegram_send_poll(
+    chat_id: str,
+    question: str,
+    options: list[str],
+    is_anonymous: bool = True,
+    allows_multiple_answers: bool = False,
+) -> str:
+    """Send a poll to a chat.
+
+    Args:
+        chat_id: The chat ID to send the poll to.
+        question: The poll question.
+        options: List of poll option strings (2-10 options).
+        is_anonymous: Whether the poll is anonymous. Defaults to True.
+        allows_multiple_answers: Allow users to select multiple options. Defaults to False.
+
+    Returns:
+        Success message with poll ID.
+    """
+    try:
+        if not question:
+            return "Poll question cannot be empty."
+
+        if not options or len(options) < 2:
+            return "Poll must have at least 2 options."
+
+        if len(options) > 10:
+            return "Poll cannot have more than 10 options."
+
+        for i, opt in enumerate(options):
+            if not opt:
+                return f"Option {i + 1} cannot be empty."
+
+        client = get_client()
+        result = await client.send_poll(
+            chat_id=chat_id,
+            question=question,
+            options=options,
+            is_anonymous=is_anonymous,
+            allows_multiple_answers=allows_multiple_answers,
+        )
+
+        return f"Poll sent successfully!\nMessage ID: {result.get('message_id')}"
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_send_poll",
+            e,
+            category=ErrorCategory.POLL,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id,
+            options=len(options),
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Get Chat Info", readOnlyHint=True, openWorldHint=True)
+)
+@validate_id("chat_id")
+async def telegram_get_chat_info(
+    chat_id: str,
+) -> str:
+    """Get detailed information about a chat.
+
+    Args:
+        chat_id: The chat ID to get information about.
+
+    Returns:
+        JSON-formatted chat information.
+    """
+    try:
+        client = get_client()
+        chat_info = await client.get_chat(chat_id=chat_id)
+
+        return json.dumps(chat_info, indent=2)
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_get_chat_info",
+            e,
+            category=ErrorCategory.CHAT,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Get Chat Member", readOnlyHint=True, openWorldHint=True)
+)
+@validate_id("chat_id")
+async def telegram_get_chat_member(
+    chat_id: str,
+    user_id: int,
+) -> str:
+    """Get information about a chat member.
+
+    Args:
+        chat_id: The chat ID.
+        user_id: The user ID.
+
+    Returns:
+        JSON-formatted member information.
+    """
+    try:
+        client = get_client()
+        member_info = await client.get_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+        )
+
+        return json.dumps(member_info, indent=2)
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_get_chat_member",
+            e,
+            category=ErrorCategory.CHAT,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id,
+            user_id=user_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Get Chat Member Count", readOnlyHint=True, openWorldHint=True)
+)
+@validate_id("chat_id")
+async def telegram_get_chat_member_count(
+    chat_id: str,
+) -> str:
+    """Get the number of members in a chat.
+
+    Args:
+        chat_id: The chat ID.
+
+    Returns:
+        Member count as a string.
+    """
+    try:
+        client = get_client()
+        count = await client.get_chat_member_count(chat_id=chat_id)
+
+        return f"Chat has {count} member(s)."
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_get_chat_member_count",
+            e,
+            category=ErrorCategory.CHAT,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Set Typing", destructiveHint=True, openWorldHint=True)
+)
+@validate_id("chat_id")
+async def telegram_set_typing(
+    chat_id: str,
+) -> str:
+    """Send a typing indicator to a chat.
+
+    Args:
+        chat_id: The chat ID.
+
+    Returns:
+        Success message.
+    """
+    try:
+        client = get_client()
+        await client.set_typing(chat_id=chat_id)
+
+        return "Typing indicator sent successfully!"
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_set_typing",
+            e,
+            category=ErrorCategory.CHAT,
+            user_message=format_telegram_error(e),
+            chat_id=chat_id,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Get Bot Info", readOnlyHint=True, openWorldHint=True)
+)
+async def telegram_get_bot_info() -> str:
+    """Get information about the Telegram bot.
+
+    Returns:
+        JSON-formatted bot information.
+    """
+    try:
+        client = get_client()
+        bot_info = await client.get_me()
+
+        return json.dumps(bot_info, indent=2)
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_get_bot_info",
+            e,
+            category=ErrorCategory.AUTH,
+            user_message=format_telegram_error(e),
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Get Queued Messages", readOnlyHint=True)
+)
+async def telegram_get_queued_messages(
+    clear_after_read: bool = False,
+) -> str:
+    """Get messages from the polling service queue.
+
+    Use this to retrieve commands sent while OpenCode wasn't running.
+
+    Args:
+        clear_after_read: Clear the queue after reading messages (default: false).
+
+    Returns:
+        JSON-formatted list of queued messages or message indicating no messages found.
+    """
+    try:
+        messages = get_queued_messages(clear_after_read=clear_after_read)
+
+        if not messages:
+            return "No queued messages found."
+
+        return json.dumps(messages, indent=2)
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_get_queued_messages",
+            e,
+            category=ErrorCategory.GENERAL,
+            user_message=f"Error reading queue file at {get_queue_file_path()}",
+        )
 
 
 async def run_server():
     """Run the MCP server."""
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
-        )
+    import sys
+
+    # Ensure queue directory exists
+    queue_path = get_queue_file_path()
+    queue_path.parent.mkdir(parents=True, exist_ok=True)
+
+    await mcp.run(transport="stdio")
+
+
+async def cleanup_resources():
+    """Clean up global resources."""
+    global _telegram_client
+    if _telegram_client:
+        await _telegram_client.close()
+        _telegram_client = None
 
 
 def main():
     """Main entry point."""
-    asyncio.run(run_server())
+    try:
+        asyncio.run(run_server())
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt, shutting down...")
+    finally:
+        asyncio.run(cleanup_resources())
 
 
 if __name__ == "__main__":

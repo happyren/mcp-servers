@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  telegram-mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: telegram-mcp-server
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - TELEGRAM_API_BASE_URL=${TELEGRAM_API_BASE_URL:-https://api.telegram.org}
+    volumes:
+      - telegram_queue:/root/.local/share/telegram_mcp_server
+    stdin_open: true
+    tty: true
+
+  telegram-mcp-polling:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: telegram-mcp-polling
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_API_BASE_URL=${TELEGRAM_API_BASE_URL:-https://api.telegram.org}
+    volumes:
+      - telegram_queue:/root/.local/share/telegram_mcp_server
+    command: telegram-mcp-polling
+
+volumes:
+  telegram_queue:

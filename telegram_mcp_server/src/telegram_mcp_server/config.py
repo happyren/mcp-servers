@@ -24,6 +24,10 @@ class Settings(BaseSettings):
         default=30,
         description="Long polling timeout in seconds",
     )
+    queue_dir: str = Field(
+        default="~/.local/share/telegram_mcp_server",
+        description="Directory for queue file storage",
+    )
 
     class Config:
         env_file = ".env"
