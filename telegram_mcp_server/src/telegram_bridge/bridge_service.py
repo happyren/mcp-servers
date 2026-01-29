@@ -99,8 +99,11 @@ class OpenCodeClient:
         response.raise_for_status()
         return response.json()
 
-    async def get_or_create_session(self) -> str | None:
-        """Get existing session ID or create a new one."""
+    async def get_existing_session(self) -> str | None:
+        """Get an existing session ID without creating a new one.
+        
+        Returns the first available main session (not subagent) or None if no sessions exist.
+        """
         try:
             sessions = await self.list_sessions()
             logger.debug(f"Sessions response: {sessions}")
@@ -109,11 +112,22 @@ class OpenCodeClient:
                 main_sessions = [s for s in sessions if not s.get("parentID")]
                 if main_sessions:
                     session_id = main_sessions[0]["id"]
-                    logger.info(f"Using existing session: {session_id}")
+                    logger.info(f"Found existing session: {session_id}")
                     return session_id
                 # Fall back to first session if all are subagents
                 session_id = sessions[0]["id"]
-                logger.info(f"Using session (subagent): {session_id}")
+                logger.info(f"Found existing session (subagent): {session_id}")
+                return session_id
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get existing session: {e}")
+            return None
+
+    async def get_or_create_session(self) -> str | None:
+        """Get existing session ID or create a new one."""
+        try:
+            session_id = await self.get_existing_session()
+            if session_id:
                 return session_id
             # Create new session
             logger.info("No sessions found, creating new one")
@@ -293,6 +307,73 @@ class TelegramOpenCodeBridge:
         with open(self.queue_file, "w", encoding="utf-8") as f:
             json.dump(remaining, f, indent=2, ensure_ascii=False)
 
+    def _parse_model_request(self, text: str) -> tuple[str | None, str | None, bool, str]:
+        """Parse model request from message text.
+        
+        Returns: (provider_id, model_id, create_new_session, cleaned_text)
+        
+        Examples:
+        - "use glm-4.7" -> (None, "glm-4.7", False, "")
+        - "use zhipuai-coding-plan/glm-4.7" -> ("zhipuai-coding-plan", "glm-4.7", False, "")
+        - "with new session use kimi-k2.5" -> (None, "kimi-k2.5", True, "")
+        - "new session: some question" -> (None, None, True, "some question")
+        """
+        import re
+        
+        original_text = text
+        create_new_session = False
+        provider_id = None
+        model_id = None
+        
+        # Check for new session request
+        new_session_patterns = [
+            r'\bnew\s+session\b',
+            r'\bcreate\s+(?:a\s+)?new\s+session\b',
+        ]
+        for pattern in new_session_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                create_new_session = True
+                # Remove the new session request from text
+                text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+        
+        # Parse model request patterns
+        # Pattern: "use <model>" or "with <model>" or "using <model>"
+        # Model can be "model-id" or "provider/model-id"
+        model_patterns = [
+            r'\buse\s+(?:model\s+)?([\w\-]+(?:/[\w\-\.]+)?)\b',
+            r'\bwith\s+(?:model\s+)?([\w\-]+(?:/[\w\-\.]+)?)\b',
+            r'\busing\s+(?:model\s+)?([\w\-]+(?:/[\w\-\.]+)?)\b',
+            r'\bswitch\s+to\s+([\w\-]+(?:/[\w\-\.]+)?)\b',
+        ]
+        
+        for pattern in model_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                model_spec = match.group(1)
+                # Check if it includes provider
+                if '/' in model_spec:
+                    parts = model_spec.split('/')
+                    provider_id = parts[0]
+                    model_id = parts[1]
+                else:
+                    model_id = model_spec
+                # Remove the model request from text
+                text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+                break
+        
+        # Clean up the text (remove extra whitespace)
+        cleaned_text = ' '.join(text.split())
+        
+        # If no specific content remains, use original text without the commands
+        if not cleaned_text:
+            # Remove command phrases from original
+            cleaned_text = original_text
+            for pattern in new_session_patterns + model_patterns:
+                cleaned_text = re.sub(pattern, '', cleaned_text, flags=re.IGNORECASE)
+            cleaned_text = ' '.join(cleaned_text.split())
+        
+        return provider_id, model_id, create_new_session, cleaned_text
+
     async def process_queue(self) -> None:
         """Process any new messages in the queue."""
         queue = self._read_queue()
@@ -308,22 +389,6 @@ class TelegramOpenCodeBridge:
 
         if not new_messages:
             return
-
-        # Get an appropriate session
-        if self.reply_to_telegram:
-            # For reply mode, we need an idle session
-            session_id = await self.opencode.get_or_create_telegram_session()
-            if not session_id:
-                logger.error("Failed to get idle OpenCode session, will retry")
-                return
-            self.session_id = session_id
-        elif not self.session_id:
-            self.session_id = await self.opencode.get_or_create_session()
-            if not self.session_id:
-                logger.error("Failed to get OpenCode session, will retry")
-                return
-        
-        logger.info(f"Using OpenCode session: {self.session_id}")
 
         # Process each message
         processed_ids: set[int] = set()
@@ -342,14 +407,54 @@ class TelegramOpenCodeBridge:
                 processed_ids.add(msg_id)
                 continue
 
-            # Format the prompt with context
-            prompt = f"[Telegram from @{username}]: {text}"
+            # Parse model request and session creation from text
+            requested_provider, requested_model, create_new_session, cleaned_text = self._parse_model_request(text)
+            
+            # Use requested model or fall back to default
+            provider_id = requested_provider or self.provider_id
+            model_id = requested_model or self.model_id
+            
+            # Log model change if different from default
+            if requested_model:
+                logger.info(f"Using requested model: {provider_id}/{model_id}")
 
-            # Type narrowing - we checked session_id above
+            # Handle session management
+            if create_new_session:
+                logger.info("Creating new session as requested")
+                new_session = await self.opencode.create_session()
+                if new_session:
+                    self.session_id = new_session["id"]
+                    logger.info(f"Created new session: {self.session_id}")
+                else:
+                    logger.error("Failed to create new session")
+                    continue
+            elif not self.session_id:
+                # Get or reuse existing session (don't create unless necessary)
+                logger.debug("No current session, looking for existing session to reuse")
+                session_id = await self.opencode.get_existing_session()
+                if session_id:
+                    self.session_id = session_id
+                    logger.info(f"Reusing existing session: {self.session_id}")
+                else:
+                    # Only create if absolutely no sessions exist
+                    logger.info("No existing sessions found, creating one")
+                    new_session = await self.opencode.create_session()
+                    if new_session:
+                        self.session_id = new_session["id"]
+                        logger.info(f"Created session: {self.session_id}")
+                    else:
+                        logger.error("Failed to create session")
+                        continue
+            else:
+                logger.debug(f"Using current session: {self.session_id}")
+
             session_id = self.session_id
             if not session_id:
-                logger.error("Session ID became None unexpectedly")
-                return
+                logger.error("No session available")
+                continue
+
+            # Format the prompt with context
+            prompt = f"[Telegram from @{username}]: {cleaned_text if cleaned_text else text}"
 
             # Get chat_id for reply
             chat_id = msg.get("chat_id")
@@ -357,12 +462,13 @@ class TelegramOpenCodeBridge:
             try:
                 if self.reply_to_telegram and self.telegram and chat_id:
                     # Use blocking mode - wait for response and send back to Telegram
-                    logger.info(f"Sending to OpenCode: {text[:50]}...")
+                    display_text = cleaned_text if cleaned_text else text
+                    logger.info(f"Sending to OpenCode: {display_text[:50]}...")
                     response_text = await self.opencode.send_message(
                         session_id, 
                         prompt,
-                        provider_id=self.provider_id,
-                        model_id=self.model_id,
+                        provider_id=provider_id,
+                        model_id=model_id,
                     )
                     logger.info(f"OpenCode response received for message {msg_id}")
                     
@@ -375,7 +481,8 @@ class TelegramOpenCodeBridge:
                         logger.warning(f"Empty response from OpenCode for message {msg_id}")
                 else:
                     # Send asynchronously (no reply)
-                    logger.info(f"Sending to OpenCode (async): {text[:50]}...")
+                    display_text = cleaned_text if cleaned_text else text
+                    logger.info(f"Sending to OpenCode (async): {display_text[:50]}...")
                     await self.opencode.send_prompt_async(session_id, prompt)
                     logger.info(f"Message {msg_id} queued in OpenCode")
 
