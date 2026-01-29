@@ -856,7 +856,7 @@ def run_bridge_service(
             await bridge.opencode.close()
             if bridge.telegram:
                 await bridge.telegram.close()
-            bridge._save_forwarded_ids()
+            bridge._save_state()
             logger.info("Background bridge service stopped")
     
     # Create a new event loop for this thread

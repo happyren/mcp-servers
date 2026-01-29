@@ -270,24 +270,42 @@ class TelegramOpenCodeBridge:
         self.bridge_state_file = self.queue_dir / "bridge_state.json"
 
         # Track which messages we've already forwarded
-        self.forwarded_ids: set[int] = self._load_forwarded_ids()
+        self.forwarded_ids: set[int] = set()
+        # Load state (forwarded_ids and session info)
+        self._load_state()
 
-    def _load_forwarded_ids(self) -> set[int]:
-        """Load IDs of messages we've already forwarded."""
+    def _load_state(self) -> None:
+        """Load bridge state from file (forwarded IDs and session info)."""
         if not self.bridge_state_file.exists():
-            return set()
+            return
         try:
             with open(self.bridge_state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return set(data.get("forwarded_ids", []))
+                self.forwarded_ids = set(data.get("forwarded_ids", []))
+                # Load session info
+                self.session_id = data.get("session_id")
+                session_model = data.get("session_model")
+                if session_model and len(session_model) == 2:
+                    self.session_model = tuple(session_model)
+                # Load all tracked sessions
+                sessions = data.get("sessions", {})
+                self.sessions = {k: tuple(v) for k, v in sessions.items() if len(v) == 2}
+                if self.session_id:
+                    logger.info(f"Loaded saved session: {self.session_id[:8]}... with model {self.session_model}")
         except (json.JSONDecodeError, FileNotFoundError):
-            return set()
+            pass
 
-    def _save_forwarded_ids(self) -> None:
-        """Save forwarded message IDs."""
+    def _save_state(self) -> None:
+        """Save bridge state to file (forwarded IDs and session info)."""
         self.queue_dir.mkdir(parents=True, exist_ok=True)
+        # Convert tuples to lists for JSON serialization
+        sessions_serializable = {k: list(v) for k, v in self.sessions.items()}
+        session_model_list = list(self.session_model) if self.session_model else None
         data = {
             "forwarded_ids": list(self.forwarded_ids),
+            "session_id": self.session_id,
+            "session_model": session_model_list,
+            "sessions": sessions_serializable,
             "last_updated": datetime.now().isoformat(),
         }
         with open(self.bridge_state_file, "w", encoding="utf-8") as f:
@@ -522,16 +540,40 @@ class TelegramOpenCodeBridge:
             if create_new_session:
                 logger.info("Creating new session as requested by user")
                 need_new_session = True
-            elif not self.session_id or not self.session_model:
-                logger.info(f"No current session (session_id={self.session_id}, session_model={self.session_model}), will create one")
-                need_new_session = True
-            elif self.session_model != requested_model_tuple:
+            elif not self.session_id:
+                # No current session, try to find an existing one from OpenCode
+                logger.info("No current session, checking for existing sessions...")
+                existing_session_id = await self.opencode.get_existing_session()
+                if existing_session_id:
+                    self.session_id = existing_session_id
+                    # Check if we have model info for this session from persistence
+                    if existing_session_id in self.sessions:
+                        self.session_model = self.sessions[existing_session_id]
+                        logger.info(f"Reusing existing session from OpenCode: {self.session_id[:8]}... with model {self.session_model[0]}/{self.session_model[1]}")
+                    else:
+                        # No model info known, use the requested/default model for this session
+                        self.session_model = requested_model_tuple
+                        self.sessions[existing_session_id] = requested_model_tuple
+                        logger.info(f"Reusing existing session from OpenCode: {self.session_id[:8]}... (model set to {provider_id}/{model_id})")
+                else:
+                    logger.info("No existing sessions found, will create new one")
+                    need_new_session = True
+            elif self.session_model and self.session_model != requested_model_tuple:
+                # User explicitly requested a different model than current session
                 current_provider, current_model = self.session_model
                 logger.info(f"Model mismatch: current session uses {current_provider}/{current_model}, "
                            f"but requested {provider_id}/{model_id}. Creating new session.")
                 need_new_session = True
             else:
-                logger.info(f"Reusing existing session {self.session_id[:8]}... with model {self.session_model[0]}/{self.session_model[1]}")
+                # Reuse current session
+                if self.session_model:
+                    current_provider, current_model = self.session_model
+                    logger.info(f"Reusing existing session {self.session_id[:8]}... with model {current_provider}/{current_model}")
+                else:
+                    # No model info but we have session_id - use default model for this session
+                    self.session_model = requested_model_tuple
+                    self.sessions[self.session_id] = requested_model_tuple
+                    logger.info(f"Reusing existing session {self.session_id[:8]}... (model set to {provider_id}/{model_id})")
             
             if need_new_session:
                 logger.info(f"Creating new session for model {provider_id}/{model_id}...")
@@ -545,12 +587,6 @@ class TelegramOpenCodeBridge:
                 else:
                     logger.error("Failed to create new session")
                     continue
-            else:
-                if self.session_model:
-                    current_provider, current_model = self.session_model
-                    logger.debug(f"Using current session: {self.session_id} with model {current_provider}/{current_model}")
-                else:
-                    logger.debug(f"Using current session: {self.session_id}")
 
             session_id = self.session_id
             if not session_id:
@@ -578,6 +614,12 @@ class TelegramOpenCodeBridge:
                         logger.info(f"Sending reply to Telegram: {response_text[:50]}...")
                         await self.telegram.send_message(chat_id, response_text)
                         logger.info(f"Reply sent to Telegram for message {msg_id}")
+                        # Persist this session as the last interacted one
+                        self._save_state()
+                        if self.session_id and self.session_model:
+                            logger.info(f"Persisted last interacted session: {self.session_id[:8]}... with model {self.session_model[0]}/{self.session_model[1]}")
+                        elif self.session_id:
+                            logger.info(f"Persisted last interacted session: {self.session_id[:8]}...")
                     else:
                         logger.warning(f"Empty response from OpenCode for message {msg_id}")
                 else:
@@ -602,7 +644,7 @@ class TelegramOpenCodeBridge:
 
         # Save state and clean up queue
         if processed_ids:
-            self._save_forwarded_ids()
+            self._save_state()
             self._remove_from_queue(processed_ids)
 
     async def run(self) -> None:
@@ -643,7 +685,7 @@ class TelegramOpenCodeBridge:
             await self.opencode.close()
             if self.telegram:
                 await self.telegram.close()
-            self._save_forwarded_ids()
+            self._save_state()
 
 
 async def async_main(args: argparse.Namespace) -> None:
