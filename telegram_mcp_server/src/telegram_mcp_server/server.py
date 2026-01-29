@@ -1,0 +1,385 @@
+"""MCP Server for Telegram Bot API integration."""
+
+import asyncio
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any
+
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import (
+    Tool,
+    TextContent,
+)
+
+from .config import get_settings, Settings
+from .telegram_client import TelegramClient, TelegramMessage
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global state
+_telegram_client: TelegramClient | None = None
+_settings: Settings | None = None
+_pending_messages: list[TelegramMessage] = []
+
+# Queue file path for polling service
+QUEUE_FILE_PATH = Path.home() / ".local" / "share" / "telegram_mcp_server" / "message_queue.json"
+
+
+def get_client() -> TelegramClient:
+    """Get the Telegram client instance."""
+    global _telegram_client, _settings
+    if _telegram_client is None:
+        _settings = get_settings()
+        _telegram_client = TelegramClient(
+             bot_token=_settings.bot_token,
+            base_url=_settings.api_base_url,
+        )
+    return _telegram_client
+
+
+def get_default_chat_id() -> str:
+    """Get the default chat ID from settings."""
+    global _settings
+    if _settings is None:
+        _settings = get_settings()
+    return _settings.chat_id
+
+
+def get_queued_messages(clear_after_read: bool = False) -> list[dict[str, Any]]:
+    """Get messages from the polling service queue file.
+    
+    Args:
+        clear_after_read: If True, clear the queue file after reading.
+        
+    Returns:
+        List of queued messages as dictionaries.
+    """
+    if not QUEUE_FILE_PATH.exists():
+        return []
+    
+    try:
+        with open(QUEUE_FILE_PATH, 'r', encoding='utf-8') as f:
+            messages = json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
+        messages = []
+    
+    if clear_after_read and messages:
+        try:
+            QUEUE_FILE_PATH.unlink()
+        except OSError:
+            # If we can't delete, at least clear the file
+            with open(QUEUE_FILE_PATH, 'w', encoding='utf-8') as f:
+                f.write('[]')
+    
+    return messages
+
+
+# Create the MCP server
+server = Server("telegram-mcp-server")
+
+
+@server.list_tools()
+async def list_tools() -> list[Tool]:
+    """List available Telegram tools."""
+    return [
+        Tool(
+            name="telegram_send_message",
+            description="Send a message to a Telegram chat. Use this to send summaries, status updates, or any text to your Telegram account.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The message text to send. Supports Markdown formatting.",
+                    },
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Optional chat ID to send to. If not provided, uses the default configured chat ID.",
+                    },
+                    "parse_mode": {
+                        "type": "string",
+                        "enum": ["Markdown", "HTML", "None"],
+                        "description": "Parse mode for the message. Defaults to Markdown.",
+                    },
+                },
+                "required": ["message"],
+            },
+        ),
+        Tool(
+            name="telegram_send_summary",
+            description="Send a work summary to Telegram. Formats the summary nicely with a header.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Title for the summary (e.g., 'Task Completed', 'Build Status').",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "The summary content. Can include bullet points and details.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["success", "warning", "error", "info"],
+                        "description": "Status indicator for the summary. Defaults to 'info'.",
+                    },
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Optional chat ID. Uses default if not provided.",
+                    },
+                },
+                "required": ["title", "summary"],
+            },
+        ),
+        Tool(
+            name="telegram_receive_messages",
+            description="Check for and receive new messages from Telegram. Use this to get commands or instructions sent to the bot.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds for long polling. Defaults to 5 seconds for quick checks.",
+                        "default": 5,
+                    },
+                    "from_user_id": {
+                        "type": "string",
+                        "description": "Optional: Only return messages from this user ID.",
+                    },
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="telegram_reply_message",
+            description="Reply to a specific Telegram message.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "chat_id": {
+                        "type": "string",
+                        "description": "The chat ID where the original message was sent.",
+                    },
+                    "message_id": {
+                        "type": "integer",
+                        "description": "The ID of the message to reply to.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "The reply text.",
+                    },
+                },
+                "required": ["chat_id", "message_id", "text"],
+            },
+        ),
+        Tool(
+            name="telegram_get_bot_info",
+            description="Get information about the Telegram bot.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        Tool(
+            name="telegram_get_queued_messages",
+            description="Get messages from the polling service queue. Use this to retrieve commands sent while OpenCode wasn't running.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "clear_after_read": {
+                        "type": "boolean",
+                        "description": "Clear the queue after reading messages (default: false).",
+                        "default": False,
+                    },
+                },
+                "required": [],
+            },
+        ),
+    ]
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    """Handle tool calls."""
+    client = get_client()
+
+    try:
+        if name == "telegram_send_message":
+            message = arguments["message"]
+            chat_id = arguments.get("chat_id", get_default_chat_id())
+            parse_mode = arguments.get("parse_mode", "Markdown")
+            if parse_mode == "None":
+                parse_mode = None
+
+            result = await client.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode=parse_mode,
+            )
+
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Message sent successfully!\nMessage ID: {result.get('message_id')}\nChat ID: {result.get('chat', {}).get('id')}",
+                )
+            ]
+
+        elif name == "telegram_send_summary":
+            title = arguments["title"]
+            summary = arguments["summary"]
+            status = arguments.get("status", "info")
+            chat_id = arguments.get("chat_id", get_default_chat_id())
+
+            # Status emoji mapping
+            status_emoji = {
+                "success": "✅",
+                "warning": "⚠️",
+                "error": "❌",
+                "info": "ℹ️",
+            }
+
+            emoji = status_emoji.get(status, "ℹ️")
+            formatted_message = f"{emoji} *{title}*\n\n{summary}"
+
+            result = await client.send_message(
+                chat_id=chat_id,
+                text=formatted_message,
+                parse_mode="Markdown",
+            )
+
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Summary sent successfully!\nMessage ID: {result.get('message_id')}",
+                )
+            ]
+
+        elif name == "telegram_receive_messages":
+            timeout = arguments.get("timeout", 5)
+            from_user_id = arguments.get("from_user_id")
+
+            messages = await client.get_new_messages(timeout=timeout)
+
+            # Filter by user ID if specified
+            if from_user_id:
+                from_user_id_int = int(from_user_id)
+                messages = [m for m in messages if m.from_user_id == from_user_id_int]
+
+            if not messages:
+                return [
+                    TextContent(
+                        type="text",
+                        text="No new messages received.",
+                    )
+                ]
+
+            # Format messages for output
+            formatted = []
+            for msg in messages:
+                formatted.append(
+                    {
+                        "message_id": msg.message_id,
+                        "chat_id": msg.chat_id,
+                        "from_user_id": msg.from_user_id,
+                        "from_username": msg.from_username,
+                        "text": msg.text,
+                        "date": msg.date,
+                    }
+                )
+
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Received {len(messages)} new message(s):\n\n{json.dumps(formatted, indent=2)}",
+                )
+            ]
+
+        elif name == "telegram_reply_message":
+            chat_id = arguments["chat_id"]
+            message_id = arguments["message_id"]
+            text = arguments["text"]
+
+            result = await client.reply_to_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+            )
+
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Reply sent successfully!\nMessage ID: {result.get('message_id')}",
+                )
+            ]
+
+        elif name == "telegram_get_queued_messages":
+            clear_after_read = arguments.get("clear_after_read", False)
+            messages = get_queued_messages(clear_after_read=clear_after_read)
+            
+            if not messages:
+                return [
+                    TextContent(
+                        type="text",
+                        text="No queued messages found.",
+                    )
+                ]
+            
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Found {len(messages)} queued message(s):\n\n{json.dumps(messages, indent=2)}",
+                )
+            ]
+
+        elif name == "telegram_get_bot_info":
+            bot_info = await client.get_me()
+
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Bot Information:\n{json.dumps(bot_info, indent=2)}",
+                )
+            ]
+
+        else:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Unknown tool: {name}",
+                )
+            ]
+
+    except Exception as e:
+        logger.error(f"Error calling tool {name}: {e}")
+        return [
+            TextContent(
+                type="text",
+                text=f"Error: {str(e)}",
+            )
+        ]
+
+
+async def run_server():
+    """Run the MCP server."""
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            server.create_initialization_options(),
+        )
+
+
+def main():
+    """Main entry point."""
+    asyncio.run(run_server())
+
+
+if __name__ == "__main__":
+    main()

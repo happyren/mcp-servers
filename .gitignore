@@ -1,0 +1,4 @@
+**/*/.env
+**/*/systemd/
+**/*/.venv/
+**/*/__pycache__/
