@@ -236,8 +236,8 @@ class TelegramOpenCodeBridge:
         poll_interval: int = 2,
         reply_to_telegram: bool = True,
         bot_token: str | None = None,
-        provider_id: str = "github-copilot",
-        model_id: str = "claude-opus-4.5",
+        provider_id: str = "deepseek",
+        model_id: str = "deepseek-reasoner",
     ):
         self.opencode = OpenCodeClient(opencode_url)
         self.poll_interval = poll_interval
@@ -247,6 +247,8 @@ class TelegramOpenCodeBridge:
         self.session_model: tuple[str, str] | None = None  # (provider_id, model_id) of current session
         self.default_provider_id = provider_id
         self.default_model_id = model_id
+        # Track all sessions created: {session_id: (provider_id, model_id)}
+        self.sessions: dict[str, tuple[str, str]] = {}
 
         # Telegram client for replies
         self.telegram: TelegramClient | None = None
@@ -308,16 +310,22 @@ class TelegramOpenCodeBridge:
         with open(self.queue_file, "w", encoding="utf-8") as f:
             json.dump(remaining, f, indent=2, ensure_ascii=False)
 
-    def _parse_model_request(self, text: str) -> tuple[str | None, str | None, bool, str]:
-        """Parse model request from message text.
+    def _parse_commands(self, text: str) -> tuple[str | None, str | None, bool, str | None, str]:
+        """Parse commands from message text.
         
-        Returns: (provider_id, model_id, create_new_session, cleaned_text)
+        Returns: (provider_id, model_id, create_new_session, select_session_id, cleaned_text)
+        
+        Commands:
+        - /sessions - List all sessions (special handling)
+        - /session <id> or /use <id> - Select specific session
+        - use <model> - Switch to model
+        - new session - Create new session
         
         Examples:
-        - "use glm-4.7" -> (None, "glm-4.7", False, "")
-        - "use zhipuai-coding-plan/glm-4.7" -> ("zhipuai-coding-plan", "glm-4.7", False, "")
-        - "with new session use kimi-k2.5" -> (None, "kimi-k2.5", True, "")
-        - "new session: some question" -> (None, None, True, "some question")
+        - "use glm-4.7" -> (None, "glm-4.7", False, None, "")
+        - "/session abc123" -> (None, None, False, "abc123", "")
+        - "use zhipuai-coding-plan/glm-4.7" -> ("zhipuai-coding-plan", "glm-4.7", False, None, "")
+        - "with new session use kimi-k2.5" -> (None, "kimi-k2.5", True, None, "")
         """
         import re
         
@@ -325,6 +333,14 @@ class TelegramOpenCodeBridge:
         create_new_session = False
         provider_id = None
         model_id = None
+        select_session_id = None
+        
+        # Check for session selection command: /session <id> or /use <id>
+        session_select_pattern = r'^/(?:session|use)\s+(\S+)'
+        match = re.search(session_select_pattern, text, re.IGNORECASE)
+        if match:
+            select_session_id = match.group(1)
+            text = re.sub(session_select_pattern, '', text, flags=re.IGNORECASE)
         
         # Check for new session request
         new_session_patterns = [
@@ -334,12 +350,9 @@ class TelegramOpenCodeBridge:
         for pattern in new_session_patterns:
             if re.search(pattern, text, re.IGNORECASE):
                 create_new_session = True
-                # Remove the new session request from text
                 text = re.sub(pattern, '', text, flags=re.IGNORECASE)
         
         # Parse model request patterns
-        # Pattern: "use <model>" or "with <model>" or "using <model>"
-        # Model can be "model-id" or "provider/model-id"
         model_patterns = [
             r'\buse\s+(?:model\s+)?([\w\-]+(?:/[\w\-\.]+)?)\b',
             r'\bwith\s+(?:model\s+)?([\w\-]+(?:/[\w\-\.]+)?)\b',
@@ -351,29 +364,57 @@ class TelegramOpenCodeBridge:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 model_spec = match.group(1)
-                # Check if it includes provider
                 if '/' in model_spec:
                     parts = model_spec.split('/')
                     provider_id = parts[0]
                     model_id = parts[1]
                 else:
                     model_id = model_spec
-                # Remove the model request from text
                 text = re.sub(pattern, '', text, flags=re.IGNORECASE)
                 break
         
-        # Clean up the text (remove extra whitespace)
+        # Clean up the text
         cleaned_text = ' '.join(text.split())
         
-        # If no specific content remains, use original text without the commands
         if not cleaned_text:
-            # Remove command phrases from original
             cleaned_text = original_text
             for pattern in new_session_patterns + model_patterns:
                 cleaned_text = re.sub(pattern, '', cleaned_text, flags=re.IGNORECASE)
+            cleaned_text = re.sub(session_select_pattern, '', cleaned_text, flags=re.IGNORECASE)
             cleaned_text = ' '.join(cleaned_text.split())
         
-        return provider_id, model_id, create_new_session, cleaned_text
+        return provider_id, model_id, create_new_session, select_session_id, cleaned_text
+    
+    def _format_sessions_list(self, sessions: list[dict], current_session_id: str | None) -> str:
+        """Format sessions list for Telegram message."""
+        if not sessions:
+            return "No active sessions found."
+        
+        lines = ["*Active Sessions:*"]
+        for i, session in enumerate(sessions[:10], 1):  # Limit to 10 sessions
+            session_id = session.get("id", "unknown")
+            is_current = session_id == current_session_id
+            parent_id = session.get("parentID")
+            
+            # Get model info if we have it tracked
+            model_info = ""
+            if session_id in self.sessions:
+                provider, model = self.sessions[session_id]
+                model_info = f" ({provider}/{model})"
+            
+            prefix = "👉" if is_current else f"{i}."
+            session_type = "subagent" if parent_id else "main"
+            
+            # Truncate session ID for display
+            short_id = session_id[:8] + "..." if len(session_id) > 8 else session_id
+            
+            lines.append(f"{prefix} `{short_id}`{model_info} [{session_type}]")
+        
+        lines.append("")
+        lines.append("To switch session: `/session <id>` or `/use <id>`")
+        lines.append("To use model: `use <model>` (e.g., `use glm-4.7`)")
+        
+        return "\n".join(lines)
 
     async def process_queue(self) -> None:
         """Process any new messages in the queue."""
@@ -397,6 +438,7 @@ class TelegramOpenCodeBridge:
             msg_id: int | None = msg.get("message_id")
             text = msg.get("text", "")
             username = msg.get("from_username", "Unknown")
+            chat_id: int | None = msg.get("chat_id")
 
             if msg_id is None:
                 logger.warning("Message has no message_id, skipping")
@@ -408,19 +450,72 @@ class TelegramOpenCodeBridge:
                 processed_ids.add(msg_id)
                 continue
 
-            # Parse model request and session creation from text
-            requested_provider, requested_model, create_new_session, cleaned_text = self._parse_model_request(text)
+            # Check for special /sessions command
+            if text.strip().lower() == '/sessions':
+                logger.info("Listing all sessions")
+                sessions = await self.opencode.list_sessions()
+                sessions_text = self._format_sessions_list(sessions, self.session_id)
+                if self.telegram and chat_id:
+                    await self.telegram.send_message(chat_id, sessions_text)
+                self.forwarded_ids.add(msg_id)
+                processed_ids.add(msg_id)
+                continue
+            
+            # Parse commands from text
+            requested_provider, requested_model, create_new_session, select_session_id, cleaned_text = self._parse_commands(text)
+            
+            # Handle session selection command
+            if select_session_id:
+                logger.info(f"Selecting session: {select_session_id}")
+                # Verify session exists
+                all_sessions = await self.opencode.list_sessions()
+                session_ids: list[str] = [str(s.get("id")) for s in all_sessions if s.get("id")]
+                
+                # Try exact match first
+                if select_session_id in session_ids:
+                    self.session_id = select_session_id
+                    if select_session_id in self.sessions:
+                        self.session_model = self.sessions[select_session_id]
+                        logger.info(f"Switched to session: {select_session_id} with model {self.session_model[0]}/{self.session_model[1]}")
+                    else:
+                        self.session_model = None
+                        logger.info(f"Switched to session: {select_session_id} (model unknown)")
+                    
+                    if self.telegram and chat_id:
+                        await self.telegram.send_message(chat_id, f"✅ Switched to session `{select_session_id[:8]}...`")
+                else:
+                    # Try partial match
+                    matching = [sid for sid in session_ids if sid.startswith(select_session_id)]
+                    if len(matching) == 1:
+                        self.session_id = matching[0]
+                        if matching[0] in self.sessions:
+                            self.session_model = self.sessions[matching[0]]
+                        else:
+                            self.session_model = None
+                        logger.info(f"Switched to session (partial match): {matching[0]}")
+                        if self.telegram and chat_id:
+                            await self.telegram.send_message(chat_id, f"✅ Switched to session `{matching[0][:8]}...`")
+                    elif len(matching) > 1:
+                        logger.warning(f"Multiple sessions match '{select_session_id}': {matching}")
+                        if self.telegram and chat_id:
+                            await self.telegram.send_message(chat_id, f"⚠️ Multiple sessions match. Please use full session ID.")
+                    else:
+                        logger.error(f"Session not found: {select_session_id}")
+                        if self.telegram and chat_id:
+                            await self.telegram.send_message(chat_id, f"❌ Session not found: `{select_session_id}`")
+                
+                self.forwarded_ids.add(msg_id)
+                processed_ids.add(msg_id)
+                continue
             
             # Use requested model or fall back to default
             provider_id = requested_provider or self.default_provider_id
             model_id = requested_model or self.default_model_id
             
-            # Log model change if different from default
             if requested_model:
                 logger.info(f"Using requested model: {provider_id}/{model_id}")
 
             # Handle session management
-            # Check if we need a new session due to model mismatch
             requested_model_tuple = (provider_id, model_id)
             need_new_session = False
             
@@ -428,22 +523,21 @@ class TelegramOpenCodeBridge:
                 logger.info("Creating new session as requested by user")
                 need_new_session = True
             elif not self.session_id or not self.session_model:
-                # No current session, need to create one
                 logger.debug("No current session, will create one")
                 need_new_session = True
             elif self.session_model != requested_model_tuple:
-                # Current session has different model, need new session
                 current_provider, current_model = self.session_model
                 logger.info(f"Model mismatch: current session uses {current_provider}/{current_model}, "
                            f"but requested {provider_id}/{model_id}. Creating new session.")
                 need_new_session = True
             
             if need_new_session:
-                # Create a new session - it will use the requested model
                 new_session = await self.opencode.create_session()
                 if new_session:
                     self.session_id = new_session["id"]
                     self.session_model = requested_model_tuple
+                    assert self.session_id is not None  # Type safety
+                    self.sessions[self.session_id] = requested_model_tuple
                     logger.info(f"Created new session: {self.session_id} with model {provider_id}/{model_id}")
                 else:
                     logger.error("Failed to create new session")
@@ -462,9 +556,6 @@ class TelegramOpenCodeBridge:
 
             # Format the prompt with context
             prompt = f"[Telegram from @{username}]: {cleaned_text if cleaned_text else text}"
-
-            # Get chat_id for reply
-            chat_id = msg.get("chat_id")
 
             try:
                 if self.reply_to_telegram and self.telegram and chat_id:
@@ -621,13 +712,13 @@ Environment variables:
     )
     parser.add_argument(
         "--provider",
-        default="github-copilot",
-        help="OpenCode provider ID (default: github-copilot)",
+        default="deepseek",
+        help="OpenCode provider ID (default: deepseek)",
     )
     parser.add_argument(
         "--model",
-        default="claude-opus-4.5",
-        help="OpenCode model ID (default: claude-opus-4.5)",
+        default="deepseek-reasoner",
+        help="OpenCode model ID (default: deepseek-reasoner)",
     )
     parser.add_argument(
         "--verbose", "-v",
