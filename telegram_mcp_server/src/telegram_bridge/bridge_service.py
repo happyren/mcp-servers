@@ -336,7 +336,7 @@ class TelegramOpenCodeBridge:
         Commands:
         - /sessions - List all sessions (special handling)
         - /session <id> or /use <id> - Select specific session
-        - use <model> - Switch to model
+        - use <model> - Switch to model (must be at beginning of message)
         - new session - Create new session
         
         Examples:
@@ -353,49 +353,74 @@ class TelegramOpenCodeBridge:
         model_id = None
         select_session_id = None
         
+        # Strip whitespace for command parsing
+        text = text.strip()
+        
         # Check for session selection command: /session <id> or /use <id>
         session_select_pattern = r'^/(?:session|use)\s+(\S+)'
         match = re.search(session_select_pattern, text, re.IGNORECASE)
         if match:
             select_session_id = match.group(1)
             text = re.sub(session_select_pattern, '', text, flags=re.IGNORECASE)
+            text = text.strip()
         
-        # Check for new session request
+        # Check for new session request (must be at beginning)
         new_session_patterns = [
-            r'\bnew\s+session\b',
-            r'\bcreate\s+(?:a\s+)?new\s+session\b',
+            r'^new\s+session\b',
+            r'^create\s+(?:a\s+)?new\s+session\b',
         ]
         for pattern in new_session_patterns:
             if re.search(pattern, text, re.IGNORECASE):
                 create_new_session = True
                 text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+                text = text.strip()
         
-        # Parse model request patterns
+        # Parse model request patterns (must be at beginning)
         model_patterns = [
-            r'\buse\s+(?:model\s+)?([\w\-]+(?:/[\w\-\.]+)?)\b',
-            r'\bwith\s+(?:model\s+)?([\w\-]+(?:/[\w\-\.]+)?)\b',
-            r'\busing\s+(?:model\s+)?([\w\-]+(?:/[\w\-\.]+)?)\b',
-            r'\bswitch\s+to\s+([\w\-]+(?:/[\w\-\.]+)?)\b',
+            r'^use\s+(?:model\s+)?([\w\-]+(?:/[\w\-\.]+)?)\b',
+            r'^with\s+(?:model\s+)?([\w\-]+(?:/[\w\-\.]+)?)\b',
+            r'^using\s+(?:model\s+)?([\w\-]+(?:/[\w\-\.]+)?)\b',
+            r'^switch\s+to\s+([\w\-]+(?:/[\w\-\.]+)?)\b',
         ]
         
         for pattern in model_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 model_spec = match.group(1)
-                if '/' in model_spec:
+                
+                # Map common model aliases to provider/model
+                model_map = {
+                    'claude': ('anthropic', 'claude'),
+                    'claude-3': ('anthropic', 'claude-3'),
+                    'gpt': ('openai', 'gpt-4'),
+                    'gpt-4': ('openai', 'gpt-4'),
+                    'gpt-3.5': ('openai', 'gpt-3.5-turbo'),
+                    'deepseek': ('deepseek', 'deepseek-reasoner'),
+                    'deepseek-reasoner': ('deepseek', 'deepseek-reasoner'),
+                    'glm': ('zhipuai-coding-plan', 'glm-4.7'),
+                    'kimi': ('kimi', 'kimi-k2.5'),
+                }
+                
+                if model_spec in model_map:
+                    provider_id, model_id = model_map[model_spec]
+                elif '/' in model_spec:
                     parts = model_spec.split('/')
                     provider_id = parts[0]
                     model_id = parts[1]
                 else:
                     model_id = model_spec
+                    # Default provider for unmapped models
+                    provider_id = None
+                
                 text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+                text = text.strip()
                 break
         
         # Clean up the text
         cleaned_text = ' '.join(text.split())
         
         if not cleaned_text:
-            cleaned_text = original_text
+            cleaned_text = original_text.strip()
             for pattern in new_session_patterns + model_patterns:
                 cleaned_text = re.sub(pattern, '', cleaned_text, flags=re.IGNORECASE)
             cleaned_text = re.sub(session_select_pattern, '', cleaned_text, flags=re.IGNORECASE)
@@ -632,19 +657,20 @@ class TelegramOpenCodeBridge:
                     )
                     logger.info(f"OpenCode response received for message {msg_id}")
                     
-                    if response_text:
-                        # Send response back to Telegram
-                        logger.info(f"Sending reply to Telegram: {response_text[:50]}...")
-                        await self.telegram.send_message(chat_id, response_text)
-                        logger.info(f"Reply sent to Telegram for message {msg_id}")
-                        # Persist this session as the last interacted one
-                        self._save_state()
-                        if self.session_id and self.session_model:
-                            logger.info(f"Persisted last interacted session: {self.session_id[:8]}... with model {self.session_model[0]}/{self.session_model[1]}")
-                        elif self.session_id:
-                            logger.info(f"Persisted last interacted session: {self.session_id[:8]}...")
-                    else:
-                        logger.warning(f"Empty response from OpenCode for message {msg_id}")
+                    # Always send response back to Telegram, even if empty
+                    if not response_text:
+                        response_text = "AI returned empty response (execution may have been aborted)"
+                        logger.warning(f"Empty response from OpenCode for message {msg_id}, sending default message")
+                    
+                    logger.info(f"Sending reply to Telegram: {response_text[:50]}...")
+                    await self.telegram.send_message(chat_id, response_text)
+                    logger.info(f"Reply sent to Telegram for message {msg_id}")
+                    # Persist this session as the last interacted one
+                    self._save_state()
+                    if self.session_id and self.session_model:
+                        logger.info(f"Persisted last interacted session: {self.session_id[:8]}... with model {self.session_model[0]}/{self.session_model[1]}")
+                    elif self.session_id:
+                        logger.info(f"Persisted last interacted session: {self.session_id[:8]}...")
                 else:
                     # Send asynchronously (no reply)
                     display_text = cleaned_text if cleaned_text else text
@@ -662,8 +688,42 @@ class TelegramOpenCodeBridge:
                     logger.info(f"Clearing session due to HTTP {e.response.status_code} error")
                     self.session_id = None
                     self.session_model = None
+                
+                # Send error to Telegram if reply is enabled
+                if self.reply_to_telegram and self.telegram and chat_id:
+                    try:
+                        error_msg = f"OpenCode error {e.response.status_code}"
+                        # Try to extract error details from response
+                        try:
+                            error_data = e.response.json()
+                            error_detail = error_data.get('error', {}).get('message', str(e))
+                            error_msg = f"OpenCode error {e.response.status_code}: {error_detail[:200]}"
+                        except:
+                            error_msg = f"OpenCode error {e.response.status_code}: {str(e)[:200]}"
+                        
+                        await self.telegram.send_message(chat_id, error_msg)
+                        logger.info(f"Sent error to Telegram for message {msg_id}")
+                    except Exception as send_error:
+                        logger.error(f"Failed to send error to Telegram: {send_error}")
+                
+                # Mark as forwarded to avoid resending
+                self.forwarded_ids.add(msg_id)
+                processed_ids.add(msg_id)
             except Exception as e:
                 logger.error(f"Error sending message {msg_id} to OpenCode: {e}")
+                
+                # Send error to Telegram if reply is enabled
+                if self.reply_to_telegram and self.telegram and chat_id:
+                    try:
+                        error_msg = f"Error processing message: {str(e)[:200]}"
+                        await self.telegram.send_message(chat_id, error_msg)
+                        logger.info(f"Sent error to Telegram for message {msg_id}")
+                    except Exception as send_error:
+                        logger.error(f"Failed to send error to Telegram: {send_error}")
+                
+                # Mark as forwarded to avoid resending
+                self.forwarded_ids.add(msg_id)
+                processed_ids.add(msg_id)
 
         # Save state and clean up queue
         if processed_ids:
