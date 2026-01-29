@@ -52,6 +52,7 @@ class TelegramClient:
         self._max_retries = max_retries
         self._retry_delay = retry_delay
         self._client = httpx.AsyncClient(timeout=60.0)
+        self._bot_user_id: int | None = None
 
     async def close(self) -> None:
         """Close the HTTP client."""
@@ -395,6 +396,16 @@ class TelegramClient:
         result = await self._request_with_retry("getUpdates", params)
         return result if isinstance(result, list) else []
 
+    async def _get_bot_user_id(self) -> int | None:
+        """Get the bot's own user ID, caching it for future use."""
+        if self._bot_user_id is None:
+            try:
+                bot_info = await self.get_me()
+                self._bot_user_id = bot_info.get("id")
+            except Exception as e:
+                logger.warning(f"Failed to get bot user ID: {e}")
+        return self._bot_user_id
+
     async def get_new_messages(self, timeout: int = 30) -> list[TelegramMessage]:
         """Get new messages since the last check.
 
@@ -402,8 +413,11 @@ class TelegramClient:
             timeout: Long polling timeout
 
         Returns:
-            List of new messages
+            List of new messages (excluding messages sent by the bot itself)
         """
+        # Get bot's user ID to filter out own messages
+        bot_user_id = await self._get_bot_user_id()
+
         updates = await self.get_updates(
             offset=self._last_update_id,
             timeout=timeout,
@@ -419,11 +433,17 @@ class TelegramClient:
             msg_data = update.get("message")
             if msg_data:
                 from_user = msg_data.get("from", {})
+                from_user_id = from_user.get("id")
+
+                # Skip messages sent by the bot itself to prevent loops
+                if bot_user_id and from_user_id == bot_user_id:
+                    continue
+
                 messages.append(
                     TelegramMessage(
                         message_id=msg_data.get("message_id", 0),
                         chat_id=msg_data.get("chat", {}).get("id", 0),
-                        from_user_id=from_user.get("id"),
+                        from_user_id=from_user_id,
                         from_username=from_user.get("username"),
                         text=msg_data.get("text"),
                         date=msg_data.get("date", 0),
