@@ -244,8 +244,9 @@ class TelegramOpenCodeBridge:
         self.reply_to_telegram = reply_to_telegram
         self.running = False
         self.session_id: str | None = None
-        self.provider_id = provider_id
-        self.model_id = model_id
+        self.session_model: tuple[str, str] | None = None  # (provider_id, model_id) of current session
+        self.default_provider_id = provider_id
+        self.default_model_id = model_id
 
         # Telegram client for replies
         self.telegram: TelegramClient | None = None
@@ -411,42 +412,48 @@ class TelegramOpenCodeBridge:
             requested_provider, requested_model, create_new_session, cleaned_text = self._parse_model_request(text)
             
             # Use requested model or fall back to default
-            provider_id = requested_provider or self.provider_id
-            model_id = requested_model or self.model_id
+            provider_id = requested_provider or self.default_provider_id
+            model_id = requested_model or self.default_model_id
             
             # Log model change if different from default
             if requested_model:
                 logger.info(f"Using requested model: {provider_id}/{model_id}")
 
             # Handle session management
+            # Check if we need a new session due to model mismatch
+            requested_model_tuple = (provider_id, model_id)
+            need_new_session = False
+            
             if create_new_session:
-                logger.info("Creating new session as requested")
+                logger.info("Creating new session as requested by user")
+                need_new_session = True
+            elif not self.session_id or not self.session_model:
+                # No current session, need to create one
+                logger.debug("No current session, will create one")
+                need_new_session = True
+            elif self.session_model != requested_model_tuple:
+                # Current session has different model, need new session
+                current_provider, current_model = self.session_model
+                logger.info(f"Model mismatch: current session uses {current_provider}/{current_model}, "
+                           f"but requested {provider_id}/{model_id}. Creating new session.")
+                need_new_session = True
+            
+            if need_new_session:
+                # Create a new session - it will use the requested model
                 new_session = await self.opencode.create_session()
                 if new_session:
                     self.session_id = new_session["id"]
-                    logger.info(f"Created new session: {self.session_id}")
+                    self.session_model = requested_model_tuple
+                    logger.info(f"Created new session: {self.session_id} with model {provider_id}/{model_id}")
                 else:
                     logger.error("Failed to create new session")
                     continue
-            elif not self.session_id:
-                # Get or reuse existing session (don't create unless necessary)
-                logger.debug("No current session, looking for existing session to reuse")
-                session_id = await self.opencode.get_existing_session()
-                if session_id:
-                    self.session_id = session_id
-                    logger.info(f"Reusing existing session: {self.session_id}")
-                else:
-                    # Only create if absolutely no sessions exist
-                    logger.info("No existing sessions found, creating one")
-                    new_session = await self.opencode.create_session()
-                    if new_session:
-                        self.session_id = new_session["id"]
-                        logger.info(f"Created session: {self.session_id}")
-                    else:
-                        logger.error("Failed to create session")
-                        continue
             else:
-                logger.debug(f"Using current session: {self.session_id}")
+                if self.session_model:
+                    current_provider, current_model = self.session_model
+                    logger.debug(f"Using current session: {self.session_id} with model {current_provider}/{current_model}")
+                else:
+                    logger.debug(f"Using current session: {self.session_id}")
 
             session_id = self.session_id
             if not session_id:
@@ -519,7 +526,7 @@ class TelegramOpenCodeBridge:
         logger.info(f"Queue file: {self.queue_file}")
         logger.info(f"Poll interval: {self.poll_interval}s")
         logger.info(f"Reply to Telegram: {self.reply_to_telegram}")
-        logger.info(f"Provider: {self.provider_id}, Model: {self.model_id}")
+        logger.info(f"Default Provider: {self.default_provider_id}, Default Model: {self.default_model_id}")
 
         # Check OpenCode connection
         if not await self.opencode.health_check():
