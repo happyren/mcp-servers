@@ -762,33 +762,33 @@ async def telegram_get_queued_messages(
         )
 
 
-async def run_server():
+def run_server():
     """Run the MCP server."""
-    import sys
-
     # Ensure queue directory exists
     queue_path = get_queue_file_path()
     queue_path.parent.mkdir(parents=True, exist_ok=True)
 
-    await mcp.run(transport="stdio")
+    # FastMCP.run() is synchronous and manages its own event loop
+    mcp.run(transport="stdio")
 
 
-async def cleanup_resources():
+def cleanup_resources():
     """Clean up global resources."""
     global _telegram_client
     if _telegram_client:
-        await _telegram_client.close()
+        # Run async cleanup in a new event loop
+        asyncio.run(_telegram_client.close())
         _telegram_client = None
 
 
 def main():
     """Main entry point."""
     try:
-        asyncio.run(run_server())
+        run_server()
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt, shutting down...")
     finally:
-        asyncio.run(cleanup_resources())
+        cleanup_resources()
 
 
 if __name__ == "__main__":

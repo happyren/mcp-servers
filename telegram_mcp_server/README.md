@@ -14,8 +14,15 @@ An MCP (Model Context Protocol) server that connects to the Telegram Bot API, al
 - **Reactions & Polls**: Add emoji reactions, create polls
 - **Chat Info**: Get chat details, member info, member counts
 - **Background Polling**: Separate polling service captures messages when the MCP server isn't running
+- **Message Watcher Plugin**: OpenCode plugin that notifies when new messages arrive
 - **Retry Logic**: Automatic retry with exponential backoff for rate limits and network errors
 - **Input Validation**: Robust validation of chat IDs, user IDs, and usernames
+
+---
+
+## Agent-Friendly Setup
+
+**For AI agents**: Read [SETUP.md](SETUP.md) for complete step-by-step configuration instructions. The setup guide is designed to be followed by an agent to configure everything automatically (except obtaining the bot token and chat ID from the user).
 
 ---
 
@@ -190,6 +197,45 @@ Messages are stored in `~/.local/share/telegram_mcp_server/message_queue.json` a
 
 ---
 
+## Message Watcher Plugin (OpenCode)
+
+For real-time notifications when Telegram messages arrive, install the OpenCode watcher plugin.
+
+### Install Plugin
+
+1. Create the plugins directory:
+   ```bash
+   mkdir -p ~/.config/opencode/plugins
+   ```
+
+2. Copy the plugin file:
+   ```bash
+   cp opencode-plugins/telegram-watcher.ts ~/.config/opencode/plugins/
+   ```
+
+   Or see [SETUP.md](SETUP.md) for the full plugin source code.
+
+3. Ensure you have the plugin dependencies in `~/.config/opencode/package.json`:
+   ```json
+   {
+     "dependencies": {
+       "@opencode-ai/plugin": "^1.1.0"
+     }
+   }
+   ```
+
+4. Restart OpenCode
+
+### How It Works
+
+- The plugin watches the message queue file for changes
+- When new messages arrive (via the polling service), it:
+  - Logs the new messages to OpenCode's log system
+  - Sends a macOS notification (on supported systems)
+  - Reports pending message count when sessions become idle
+
+---
+
 ## Docker Deployment
 
 ### Build and Run
@@ -266,6 +312,8 @@ telegram_mcp_server/
 │   └── telegram_polling_service/
 │       ├── __init__.py
 │       └── polling_service.py # Background message polling
+├── opencode-plugins/
+│   └── telegram-watcher.ts    # OpenCode notification plugin
 ├── tests/
 │   ├── conftest.py
 │   └── test_validation.py
@@ -275,6 +323,7 @@ telegram_mcp_server/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── pyproject.toml
+├── SETUP.md                   # Agent-friendly setup guide
 └── README.md
 ```
 
