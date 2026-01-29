@@ -1,7 +1,5 @@
 # Telegram MCP Server
 
-[![Python Lint & Format Check](https://github.com/your-org/telegram-mcp-server/actions/workflows/lint.yml/badge.svg)](https://github.com/your-org/telegram-mcp-server/actions/workflows/lint.yml)
-[![Python Tests](https://github.com/your-org/telegram-mcp-server/actions/workflows/test.yml/badge.svg)](https://github.com/your-org/telegram-mcp-server/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 An MCP (Model Context Protocol) server that connects to the Telegram Bot API, allowing AI agents like OpenCode and Claude to send messages, summaries, and receive commands via Telegram.
@@ -107,7 +105,7 @@ This enables:
 
 ---
 
-## Available Tools (16 total)
+## Available Tools (17 total)
 
 ### Messaging
 
@@ -140,6 +138,7 @@ This enables:
 | Tool | Description |
 |------|-------------|
 | `telegram_get_queued_messages` | Get messages captured by polling service |
+| `telegram_check_new` | Check for new messages in the queue (returns new messages since last check) |
 
 ---
 
@@ -393,3 +392,9 @@ telegram_mcp_server/
 ## License
 
 MIT License - see [LICENSE](LICENSE) file.
+
+---
+
+## Repository
+
+[https://github.com/happyren/mcp-servers](https://github.com/happyren/mcp-servers)
