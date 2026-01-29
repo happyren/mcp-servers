@@ -873,8 +873,8 @@ def start_background_services(
     enable_bridge: bool = False,
     opencode_url: str = "http://localhost:4096",
     reply_to_telegram: bool = True,
-    provider_id: str = "github-copilot",
-    model_id: str = "claude-opus-4.5",
+    provider_id: str = "deepseek",
+    model_id: str = "deepseek-reasoner",
 ):
     """Start background services in daemon threads."""
     global _polling_thread, _bridge_thread
@@ -996,13 +996,13 @@ Environment variables:
     )
     parser.add_argument(
         "--provider",
-        default=os.environ.get("TELEGRAM_PROVIDER", "github-copilot"),
-        help="OpenCode provider ID (default: github-copilot)",
+        default=os.environ.get("TELEGRAM_PROVIDER", "deepseek"),
+        help="OpenCode provider ID (default: deepseek)",
     )
     parser.add_argument(
         "--model",
-        default=os.environ.get("TELEGRAM_MODEL", "claude-opus-4.5"),
-        help="OpenCode model ID (default: claude-opus-4.5)",
+        default=os.environ.get("TELEGRAM_MODEL", "deepseek-reasoner"),
+        help="OpenCode model ID (default: deepseek-reasoner)",
     )
     parser.add_argument(
         "--verbose", "-v",

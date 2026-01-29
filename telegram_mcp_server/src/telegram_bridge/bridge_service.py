@@ -189,8 +189,8 @@ class OpenCodeClient:
         self, 
         session_id: str, 
         message: str,
-        provider_id: str = "github-copilot",
-        model_id: str = "claude-opus-4.5",
+        provider_id: str = "deepseek",
+        model_id: str = "deepseek-reasoner",
     ) -> str:
         """Send a message and wait for response (blocking). Returns response text."""
         response = await self.client.post(

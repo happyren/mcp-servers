@@ -97,8 +97,8 @@ The `--enable-polling` and `--enable-bridge` flags enable:
 Additional optional flags:
 - `--opencode-url http://localhost:4096` - OpenCode HTTP API URL (default: localhost:4096)
 - `--no-reply` - Disable sending responses back to Telegram
-- `--provider <id>` - AI provider ID (default: github-copilot)
-- `--model <id>` - AI model ID (default: claude-opus-4.5)
+- `--provider <id>` - AI provider ID (default: deepseek)
+- `--model <id>` - AI model ID (default: deepseek-reasoner)
 
 If the config file already exists with other settings, merge the `mcp` section into the existing config.
 

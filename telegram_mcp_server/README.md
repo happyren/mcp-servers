@@ -213,8 +213,8 @@ telegram-mcp-server --enable-polling --enable-bridge --no-reply
 | `--enable-bridge` | `TELEGRAM_ENABLE_BRIDGE` | false | Enable OpenCode bridge |
 | `--opencode-url` | `TELEGRAM_OPENCODE_URL` | `http://localhost:4096` | OpenCode HTTP API URL |
 | `--no-reply` | `TELEGRAM_NO_REPLY` | false | Disable sending responses back |
-| `--provider` | `TELEGRAM_PROVIDER` | `github-copilot` | AI provider ID |
-| `--model` | `TELEGRAM_MODEL` | `claude-opus-4.5` | AI model ID |
+| `--provider` | `TELEGRAM_PROVIDER` | `deepseek` | AI provider ID |
+| `--model` | `TELEGRAM_MODEL` | `deepseek-reasoner` | AI model ID |
 | `--verbose` | - | false | Enable debug logging |
 
 Messages are stored in `~/.local/share/telegram_mcp_server/message_queue.json` and can be retrieved with `telegram_get_queued_messages`.
@@ -262,8 +262,8 @@ docker compose up -d
 | `TELEGRAM_ENABLE_BRIDGE` | No | `false` | Enable integrated bridge |
 | `TELEGRAM_OPENCODE_URL` | No | `http://localhost:4096` | OpenCode HTTP API URL |
 | `TELEGRAM_NO_REPLY` | No | `false` | Disable sending replies to Telegram |
-| `TELEGRAM_PROVIDER` | No | `github-copilot` | AI provider for bridge |
-| `TELEGRAM_MODEL` | No | `claude-opus-4.5` | AI model for bridge |
+| `TELEGRAM_PROVIDER` | No | `deepseek` | AI provider for bridge |
+| `TELEGRAM_MODEL` | No | `deepseek-reasoner` | AI model for bridge |
 
 ---
 
