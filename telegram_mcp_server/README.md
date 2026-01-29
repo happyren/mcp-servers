@@ -14,7 +14,6 @@ An MCP (Model Context Protocol) server that connects to the Telegram Bot API, al
 - **Integrated Services**: Built-in polling and OpenCode bridge - no separate processes needed!
 - **Background Polling**: Captures messages even when the AI agent isn't actively listening
 - **Two-Way Bridge**: Forwards Telegram messages to OpenCode and sends responses back
-- **Message Watcher Plugin**: OpenCode plugin that notifies when new messages arrive
 - **Retry Logic**: Automatic retry with exponential backoff for rate limits and network errors
 - **Input Validation**: Robust validation of chat IDs, user IDs, and usernames
 
@@ -218,72 +217,7 @@ telegram-mcp-server --enable-polling --enable-bridge --no-reply
 | `--model` | `TELEGRAM_MODEL` | `claude-opus-4.5` | AI model ID |
 | `--verbose` | - | false | Enable debug logging |
 
-### Standalone Mode (Legacy)
-
-You can still run the services separately if needed:
-
-```bash
-# Run polling service standalone
-telegram-mcp-polling
-
-# Run bridge service standalone  
-telegram-opencode-bridge --opencode-url http://localhost:4096 --reply
-```
-
-### Run as Systemd Service
-
-```bash
-# Copy the service file
-sudo cp telegram-mcp-polling@.service /etc/systemd/system/
-
-# Enable and start
-sudo systemctl enable telegram-mcp-polling@$USER
-sudo systemctl start telegram-mcp-polling@$USER
-
-# Check status
-sudo systemctl status telegram-mcp-polling@$USER
-```
-
 Messages are stored in `~/.local/share/telegram_mcp_server/message_queue.json` and can be retrieved with `telegram_get_queued_messages`.
-
----
-
-## Message Watcher Plugin (OpenCode)
-
-For real-time notifications when Telegram messages arrive, install the OpenCode watcher plugin.
-
-### Install Plugin
-
-1. Create the plugins directory:
-   ```bash
-   mkdir -p ~/.config/opencode/plugins
-   ```
-
-2. Copy the plugin file:
-   ```bash
-   cp opencode-plugins/telegram-watcher.ts ~/.config/opencode/plugins/
-   ```
-
-   Or see [SETUP.md](SETUP.md) for the full plugin source code.
-
-3. Ensure you have the plugin dependencies in `~/.config/opencode/package.json`:
-   ```json
-   {
-     "dependencies": {
-       "@opencode-ai/plugin": "^1.1.0"
-     }
-   }
-   ```
-
-4. Restart OpenCode
-
-### How It Works
-
-- The plugin watches the message queue file for changes
-- When new messages arrive (via the polling service), it:
-  - Logs the new messages to OpenCode's log system
-  - Sends a macOS notification (on supported systems)
-  - Reports pending message count when sessions become idle
 
 ---
 
@@ -372,14 +306,9 @@ telegram_mcp_server/
 │   └── telegram_bridge/
 │       ├── __init__.py
 │       └── bridge_service.py  # OpenCode bridge service
-├── opencode-plugins/
-│   └── telegram-watcher.ts    # OpenCode notification plugin
 ├── tests/
 │   ├── conftest.py
 │   └── test_validation.py
-├── .github/workflows/
-│   ├── lint.yml
-│   └── test.yml
 ├── Dockerfile
 ├── docker-compose.yml
 ├── pyproject.toml
