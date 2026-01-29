@@ -565,15 +565,38 @@ class TelegramOpenCodeBridge:
                            f"but requested {provider_id}/{model_id}. Creating new session.")
                 need_new_session = True
             else:
-                # Reuse current session
-                if self.session_model:
+                # We have a session_id loaded from state - validate it still exists in OpenCode
+                # This handles the case when OpenCode restarts and old sessions are gone
+                logger.info(f"Validating saved session {self.session_id[:8]}... against OpenCode...")
+                all_sessions = await self.opencode.list_sessions()
+                session_ids = [str(s.get("id")) for s in all_sessions if s.get("id")]
+                
+                if self.session_id not in session_ids:
+                    logger.warning(f"Saved session {self.session_id[:8]}... no longer exists in OpenCode (likely due to restart)")
+                    self.session_id = None
+                    self.session_model = None
+                    # Try to find any existing session
+                    if session_ids:
+                        self.session_id = session_ids[0]
+                        if self.session_id in self.sessions:
+                            self.session_model = self.sessions[self.session_id]
+                            logger.info(f"Using existing OpenCode session: {self.session_id[:8]}... with model {self.session_model[0]}/{self.session_model[1]}")
+                        else:
+                            self.session_model = requested_model_tuple
+                            self.sessions[self.session_id] = requested_model_tuple
+                            logger.info(f"Using existing OpenCode session: {self.session_id[:8]}... (model set to {provider_id}/{model_id})")
+                    else:
+                        logger.info("No sessions found in OpenCode, will create new one")
+                        need_new_session = True
+                elif self.session_model:
+                    # Session exists and we have model info
                     current_provider, current_model = self.session_model
-                    logger.info(f"Reusing existing session {self.session_id[:8]}... with model {current_provider}/{current_model}")
+                    logger.info(f"Reusing saved session {self.session_id[:8]}... with model {current_provider}/{current_model}")
                 else:
-                    # No model info but we have session_id - use default model for this session
+                    # Session exists but no model info - use default
                     self.session_model = requested_model_tuple
                     self.sessions[self.session_id] = requested_model_tuple
-                    logger.info(f"Reusing existing session {self.session_id[:8]}... (model set to {provider_id}/{model_id})")
+                    logger.info(f"Reusing saved session {self.session_id[:8]}... (model set to {provider_id}/{model_id})")
             
             if need_new_session:
                 logger.info(f"Creating new session for model {provider_id}/{model_id}...")
