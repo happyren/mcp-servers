@@ -523,22 +523,25 @@ class TelegramOpenCodeBridge:
                 logger.info("Creating new session as requested by user")
                 need_new_session = True
             elif not self.session_id or not self.session_model:
-                logger.debug("No current session, will create one")
+                logger.info(f"No current session (session_id={self.session_id}, session_model={self.session_model}), will create one")
                 need_new_session = True
             elif self.session_model != requested_model_tuple:
                 current_provider, current_model = self.session_model
                 logger.info(f"Model mismatch: current session uses {current_provider}/{current_model}, "
                            f"but requested {provider_id}/{model_id}. Creating new session.")
                 need_new_session = True
+            else:
+                logger.info(f"Reusing existing session {self.session_id[:8]}... with model {self.session_model[0]}/{self.session_model[1]}")
             
             if need_new_session:
+                logger.info(f"Creating new session for model {provider_id}/{model_id}...")
                 new_session = await self.opencode.create_session()
                 if new_session:
                     self.session_id = new_session["id"]
                     self.session_model = requested_model_tuple
                     assert self.session_id is not None  # Type safety
                     self.sessions[self.session_id] = requested_model_tuple
-                    logger.info(f"Created new session: {self.session_id} with model {provider_id}/{model_id}")
+                    logger.info(f"Created new session: {self.session_id[:8]}... with model {provider_id}/{model_id}")
                 else:
                     logger.error("Failed to create new session")
                     continue
@@ -591,7 +594,9 @@ class TelegramOpenCodeBridge:
                 logger.error(f"HTTP error sending message {msg_id}: {e.response.status_code}")
                 # If session is invalid, clear it so we get a new one
                 if e.response.status_code in (404, 400):
+                    logger.info(f"Clearing session due to HTTP {e.response.status_code} error")
                     self.session_id = None
+                    self.session_model = None
             except Exception as e:
                 logger.error(f"Error sending message {msg_id} to OpenCode: {e}")
 
