@@ -416,7 +416,7 @@ class OpenCodeClient:
         return True
 
     # Helper methods for bridge
-    async def health_check(self) -> bool:
+    async def is_server_running(self) -> bool:
         """Check if OpenCode server is running."""
         try:
             response = await self.client.get(f"{self.base_url}/session")
@@ -504,7 +504,7 @@ class OpenCodeClient:
         response.raise_for_status()
         # Note: Returns 204 No Content on success
 
-    async def send_message(
+    async def send_message_text(
         self,
         session_id: str,
         message: str,

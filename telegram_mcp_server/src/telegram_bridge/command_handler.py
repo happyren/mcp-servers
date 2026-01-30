@@ -74,14 +74,14 @@ class CommandHandler:
 *Use any other text to send as a prompt to the current session.*
         """.strip()
 
-    def parse_command(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+    def parse_command(self, text: str) -> Tuple[Optional[str], str]:
         """Parse a command from text.
 
         Returns: (command_name, arguments)
         """
         text = text.strip()
         if not text.startswith("/"):
-            return None, None
+            return None, ""
 
         # Remove leading slash and split
         parts = text[1:].split(None, 1)
@@ -90,7 +90,7 @@ class CommandHandler:
 
         return command, args
 
-    async def handle_command(self, text: str, chat_id: Optional[int] = None) -> str:
+    async def handle_command(self, text: str, chat_id: Optional[int] = None) -> Optional[str]:
         """Handle a command and return response.
 
         Args:
@@ -204,9 +204,51 @@ class CommandHandler:
             path = path_info.get("path", "unknown")
             return f"📂 *Current Directory*\n\n`{path}`\n\nUsage: `/directory <path>` to set a new working directory"
 
-        # Set directory via TUI or send command
-        # Note: There's no direct API to set directory, so we inform the user
-        return f"ℹ️ To change working directory, use the OpenCode TUI or run:\n`cd {args}`\n\nCurrent directory is set by the project root."
+        # Need an active session to change directory
+        if not self.current_session_id:
+            return "❌ No active session. Use `/session` to create one or `/use <id>` to select one first."
+
+        # Send cd command via shell
+        import shlex
+        quoted_path = shlex.quote(args)
+        shell_cmd = f"cd {quoted_path}"
+        
+        try:
+            # Get current directory before change
+            old_path_info = await self.opencode.get_path()
+            old_path = old_path_info.get("path", "unknown")
+            
+            result: dict[str, Any] = await self.opencode.send_shell(self.current_session_id, shell_cmd)
+            
+            # Check for errors in response
+            parts = result.get("parts", [])
+            error_text = ""
+            output_text = ""
+            
+            for part in parts:
+                if part.get("type") == "text":
+                    text = part.get("text", "")
+                    if "error" in text.lower() or "no such" in text.lower() or "not found" in text.lower():
+                        error_text += text + "\n"
+                    else:
+                        output_text += text + "\n"
+            
+            if error_text:
+                return f"❌ Failed to change directory:\n\n```\n{error_text.strip()}\n```"
+            
+            # Get new directory to confirm
+            new_path_info = await self.opencode.get_path()
+            new_path = new_path_info.get("path", "unknown")
+            
+            if new_path != old_path:
+                return f"✅ Changed directory from:\n`{old_path}`\n\nto:\n`{new_path}`"
+            else:
+                # Path unchanged (may be project root or same directory)
+                return f"✅ Directory change command executed.\n\nCurrent directory: `{new_path}`"
+            
+        except Exception as e:
+            logger.error(f"Error changing directory: {e}")
+            return f"❌ Error changing directory: {str(e)[:200]}"
 
     async def cmd_files(self, args: str) -> str:
         path = args if args else None
@@ -372,7 +414,7 @@ class CommandHandler:
             return "❌ Usage: `/use <session_id>`"
 
         sessions = await self.opencode.list_sessions()
-        session_ids = [s.get("id") for s in sessions]
+        session_ids = [sid for s in sessions if (sid := s.get("id"))]
 
         # Try exact match first
         if args in session_ids:
@@ -397,7 +439,7 @@ class CommandHandler:
             return "❌ No active session. Use `/session` to create one or `/use <id>` to select one."
 
         try:
-            result = await self.opencode.send_message(self.current_session_id, args)
+            result: dict[str, Any] = await self.opencode.send_message(self.current_session_id, args)
             # Extract text from response
             parts = result.get("parts", [])
             text_parts = []
@@ -423,7 +465,7 @@ class CommandHandler:
             return "❌ No active session. Use `/session` to create one or `/use <id>` to select one."
 
         try:
-            result = await self.opencode.send_shell(self.current_session_id, args)
+            result: dict[str, Any] = await self.opencode.send_shell(self.current_session_id, args)
             # Extract output from response
             parts = result.get("parts", [])
             text_parts = []

@@ -314,7 +314,7 @@ class TelegramOpenCodeBridge:
                 if self.reply_to_telegram and self.telegram and chat_id:
                     # Use blocking mode - wait for response and send back to Telegram
                     logger.info(f"Sending to OpenCode: {text[:50]}...")
-                    response_text = await self.opencode.send_message(
+                    response_text = await self.opencode.send_message_text(
                         session_id,
                         prompt,
                         provider_id=provider_id,
@@ -414,7 +414,7 @@ class TelegramOpenCodeBridge:
         logger.info(f"Default Provider: {self.default_provider_id}, Default Model: {self.default_model_id}")
 
         # Check OpenCode connection
-        if not await self.opencode.health_check():
+        if not await self.opencode.is_server_running():
             logger.error(f"Cannot connect to OpenCode at {self.opencode.base_url}")
             logger.error("Make sure OpenCode is running with: opencode --port 4096")
             return
