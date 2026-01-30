@@ -185,6 +185,78 @@ telegram_send_reaction(
 
 ---
 
+## Telegram Commands
+
+When the bridge service is enabled (`--enable-bridge`), you can control OpenCode through Telegram using slash commands. Send these commands to your Telegram bot:
+
+### Core Commands
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show all available commands |
+| `/sessions` | List all OpenCode sessions |
+| `/session [model]` | Create a new session (optional model) |
+| `/use <id>` | Switch to a specific session |
+| `/status` | Get status of all sessions |
+| `/prompt <message>` | Send a prompt to current session |
+| `/shell <command>` | Execute a shell command |
+
+### File & Project Commands
+
+| Command | Description |
+|---------|-------------|
+| `/directory [path]` | View or set working directory |
+| `/files [path]` | List files in directory |
+| `/read <path>` | Read file content |
+| `/find <pattern>` | Search for text in files |
+| `/findfile <query>` | Find files by name |
+| `/find-symbol <query>` | Find workspace symbols |
+| `/projects` | List all projects |
+| `/project` | Get current project info |
+| `/vcs` | Get VCS (git) info |
+
+### Session Management Commands
+
+| Command | Description |
+|---------|-------------|
+| `/diff [session_id]` | Get session diff |
+| `/todo [session_id]` | Get todo list for session |
+| `/fork <session_id>` | Fork an existing session |
+| `/abort <session_id>` | Abort a running session |
+| `/delete <session_id>` | Delete a session |
+| `/share <session_id>` | Share a session |
+| `/unshare <session_id>` | Unshare a session |
+| `/revert <message_id>` | Revert a message |
+| `/unrevert [session_id]` | Restore reverted messages |
+| `/summarize [session_id]` | Summarize session |
+| `/info [session_id]` | Get session details |
+| `/messages [session_id]` | List messages in session |
+| `/init` | Analyze app and create AGENTS.md |
+
+### Configuration Commands
+
+| Command | Description |
+|---------|-------------|
+| `/config` | Get current config |
+| `/models` | List available models/providers |
+| `/agents` | List available agents |
+| `/login <provider>` | Authenticate with a provider |
+| `/commands` | List all OpenCode slash commands |
+
+### System Commands
+
+| Command | Description |
+|---------|-------------|
+| `/health` | Check OpenCode server health |
+| `/lsp` | Get LSP server status |
+| `/formatter` | Get formatter status |
+| `/mcp` | Get MCP server status |
+| `/dispose` | Dispose current instance |
+
+**Note**: Any message not starting with `/` is sent as a prompt to the current session.
+
+---
+
 ## Background Polling Service
 
 The MCP server now has **integrated polling and bridge services**. You can enable them with command-line flags:

@@ -133,10 +133,41 @@ If the config file already exists with other settings, merge the `mcp` section i
    - telegram_send_poll
    - telegram_get_chat_info
    - telegram_get_chat_member
-   - telegram_get_chat_member_count
-   - telegram_set_typing
-   - telegram_get_bot_info
-   - telegram_get_queued_messages
+    - telegram_get_chat_member_count
+    - telegram_set_typing
+    - telegram_get_bot_info
+    - telegram_get_queued_messages
+
+## Telegram Commands
+
+With the bridge service enabled, you can control OpenCode through Telegram using slash commands. Send these commands to your Telegram bot:
+
+### Quick Start
+
+1. **List sessions**: Send `/sessions` to see all OpenCode sessions
+2. **Send prompts**: Just type any text (not starting with `/`) to send as a prompt
+3. **Create session**: Send `/session` to create a new session
+4. **Get help**: Send `/help` to see all available commands
+
+### Common Commands
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show all available commands |
+| `/sessions` | List all sessions with status |
+| `/use <id>` | Switch to a specific session |
+| `/prompt <message>` | Send a prompt to current session |
+| `/files [path]` | List files in a directory |
+| `/read <path>` | Read a file's contents |
+| `/shell <command>` | Execute a shell command |
+
+### Full Command List
+
+See [README.md](README.md#telegram-commands) for the complete list of 35+ Telegram commands including:
+- Project & file management
+- Session operations (create, fork, abort, delete, share, revert, summarize)
+- Configuration (models, agents, auth)
+- System status (health, LSP, formatters, MCP)
 
 ---
 
