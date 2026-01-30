@@ -211,8 +211,8 @@ class CommandHandler:
         if not self.current_session_id:
             return "❌ No active session. Use `/session` to create one or `/use <id>` to select one first."
 
-        # Check if session is idle, wait up to 5 seconds if busy
-        max_wait_seconds = 5
+        # Check if session is idle, wait up to 10 seconds if busy
+        max_wait_seconds = 10
         check_interval = 0.5
         waited = 0
         
@@ -274,6 +274,18 @@ class CommandHandler:
                 return f"❌ Bad request to OpenCode (400):\n\n`{error_detail}`\n\nThis may be due to invalid session state or API changes."
             elif e.response.status_code == 429:
                 return "❌ Too many requests. Please wait before trying again."
+            elif e.response.status_code == 500:
+                error_detail = ""
+                try:
+                    error_data = e.response.json()
+                    error_msg = error_data.get("data", {}).get("message", str(error_data))
+                    if "is busy" in error_msg:
+                        session_short = self.current_session_id[:8] if self.current_session_id else "unknown"
+                        return f"❌ Session is busy. Please wait or use:\n`/abort {session_short}`\n\nOr create a new session with `/session`."
+                    error_detail = error_msg[:150]
+                except:
+                    error_detail = str(e)[:150]
+                return f"❌ OpenCode internal server error (500):\n\n`{error_detail}`"
             else:
                 logger.error(f"HTTP error changing directory: {e}")
                 return f"❌ OpenCode server error {e.response.status_code}: {str(e)[:200]}"
@@ -495,8 +507,8 @@ class CommandHandler:
         if not self.current_session_id:
             return "❌ No active session. Use `/session` to create one or `/use <id>` to select one."
 
-        # Check if session is idle, wait up to 5 seconds if busy
-        max_wait_seconds = 5
+        # Check if session is idle, wait up to 10 seconds if busy
+        max_wait_seconds = 10
         check_interval = 0.5
         waited = 0
         
@@ -535,6 +547,18 @@ class CommandHandler:
                 return f"❌ Bad request to OpenCode (400):\n\n`{error_detail}`\n\nThis may be due to invalid session state or API changes."
             elif e.response.status_code == 429:
                 return "❌ Too many requests. Please wait before trying again."
+            elif e.response.status_code == 500:
+                error_detail = ""
+                try:
+                    error_data = e.response.json()
+                    error_msg = error_data.get("data", {}).get("message", str(error_data))
+                    if "is busy" in error_msg:
+                        session_short = self.current_session_id[:8] if self.current_session_id else "unknown"
+                        return f"❌ Session is busy. Please wait or use:\n`/abort {session_short}`\n\nOr create a new session with `/session`."
+                    error_detail = error_msg[:150]
+                except:
+                    error_detail = str(e)[:150]
+                return f"❌ OpenCode internal server error (500):\n\n`{error_detail}`"
             else:
                 logger.error(f"HTTP error running shell: {e}")
                 return f"❌ OpenCode server error {e.response.status_code}: {str(e)[:200]}"
