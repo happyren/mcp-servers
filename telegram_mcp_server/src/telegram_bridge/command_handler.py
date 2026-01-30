@@ -1,8 +1,11 @@
 """Command handler for Telegram-OpenCode bridge."""
 
+import asyncio
 import logging
 import re
 from typing import Any, Optional, Tuple
+
+import httpx
 
 from .opencode_client import OpenCodeClient
 
@@ -208,6 +211,20 @@ class CommandHandler:
         if not self.current_session_id:
             return "❌ No active session. Use `/session` to create one or `/use <id>` to select one first."
 
+        # Check if session is idle, wait up to 5 seconds if busy
+        max_wait_seconds = 5
+        check_interval = 0.5
+        waited = 0
+        
+        while waited < max_wait_seconds:
+            if await self.opencode.is_session_idle(self.current_session_id):
+                break
+            await asyncio.sleep(check_interval)
+            waited += check_interval
+        
+        if not await self.opencode.is_session_idle(self.current_session_id):
+            return "❌ Session is busy. Please wait for current operations to complete and try again."
+
         # Send cd command via shell
         import shlex
         quoted_path = shlex.quote(args)
@@ -246,6 +263,20 @@ class CommandHandler:
                 # Path unchanged (may be project root or same directory)
                 return f"✅ Directory change command executed.\n\nCurrent directory: `{new_path}`"
             
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400:
+                error_detail = ""
+                try:
+                    error_data = e.response.json()
+                    error_detail = str(error_data).replace("{", "{{").replace("}", "}}")[:150]
+                except:
+                    error_detail = str(e)[:150]
+                return f"❌ Bad request to OpenCode (400):\n\n`{error_detail}`\n\nThis may be due to invalid session state or API changes."
+            elif e.response.status_code == 429:
+                return "❌ Too many requests. Please wait before trying again."
+            else:
+                logger.error(f"HTTP error changing directory: {e}")
+                return f"❌ OpenCode server error {e.response.status_code}: {str(e)[:200]}"
         except Exception as e:
             logger.error(f"Error changing directory: {e}")
             return f"❌ Error changing directory: {str(e)[:200]}"
@@ -464,6 +495,20 @@ class CommandHandler:
         if not self.current_session_id:
             return "❌ No active session. Use `/session` to create one or `/use <id>` to select one."
 
+        # Check if session is idle, wait up to 5 seconds if busy
+        max_wait_seconds = 5
+        check_interval = 0.5
+        waited = 0
+        
+        while waited < max_wait_seconds:
+            if await self.opencode.is_session_idle(self.current_session_id):
+                break
+            await asyncio.sleep(check_interval)
+            waited += check_interval
+        
+        if not await self.opencode.is_session_idle(self.current_session_id):
+            return "❌ Session is busy. Please wait for current operations to complete and try again."
+
         try:
             result: dict[str, Any] = await self.opencode.send_shell(self.current_session_id, args)
             # Extract output from response
@@ -479,8 +524,23 @@ class CommandHandler:
             if text_parts:
                 return f"💻 *Shell Output*\n\n```bash\n{args}\n```\n\n" + "\n".join(text_parts)
             return f"✅ Shell command executed: `{args}`"
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400:
+                error_detail = ""
+                try:
+                    error_data = e.response.json()
+                    error_detail = str(error_data).replace("{", "{{").replace("}", "}}")[:150]
+                except:
+                    error_detail = str(e)[:150]
+                return f"❌ Bad request to OpenCode (400):\n\n`{error_detail}`\n\nThis may be due to invalid session state or API changes."
+            elif e.response.status_code == 429:
+                return "❌ Too many requests. Please wait before trying again."
+            else:
+                logger.error(f"HTTP error running shell: {e}")
+                return f"❌ OpenCode server error {e.response.status_code}: {str(e)[:200]}"
         except Exception as e:
-            return f"❌ Error running shell: {str(e)}"
+            logger.error(f"Error running shell: {e}")
+            return f"❌ Error running shell: {str(e)[:200]}"
 
     async def cmd_diff(self, args: str) -> str:
         session_id = args if args else self.current_session_id
