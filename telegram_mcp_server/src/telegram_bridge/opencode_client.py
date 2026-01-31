@@ -293,7 +293,7 @@ class OpenCodeClient:
         response.raise_for_status()
         return response.json()
 
-    async def send_shell(self, session_id: str, command: str, agent: Optional[str] = "shell") -> dict[str, Any]:
+    async def send_shell(self, session_id: str, command: str, agent: Optional[str] = "explore") -> dict[str, Any]:
         """Run a shell command."""
         body: dict[str, Any] = {"command": command}
         if agent:

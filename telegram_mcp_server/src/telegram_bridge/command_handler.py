@@ -1,6 +1,7 @@
 """Command handler for Telegram-OpenCode bridge."""
 
 import asyncio
+import os
 import logging
 import re
 from typing import Any, Optional, Tuple
@@ -31,8 +32,9 @@ class CommandHandler:
 `/read <path>` - Read file content
 `/find <pattern>` - Search for text in files
 `/findfile <query>` - Find files by name
-`/projects` - List all projects
-`/project` - Get current project info
+ `/projects` - List all projects
+ `/project` - Get current project info
+ `/open <path>` - Open project at path (changes directory + creates session)
 
 📝 *Sessions*
 `/session [model]` - Create new session (optional: with model)
@@ -117,6 +119,7 @@ class CommandHandler:
             "projects": self.cmd_projects,
             "project": self.cmd_project,
             "directory": self.cmd_directory,
+            "open": self.cmd_open,
             "files": self.cmd_files,
             "read": self.cmd_read,
             "find": self.cmd_find,
@@ -201,6 +204,117 @@ class CommandHandler:
         path = project.get("path", "unknown")
         return f"📁 *Current Project*\n\n**Name:** {name}\n**Path:** `{path}`"
 
+    async def cmd_open(self, args: str) -> str:
+        if not args:
+            return "❌ Usage: `/open <project_path>`\n\nExample: `/open ~/dev/my-app`\n\nThis will:\n1. Change to the directory\n2. Create a new session for the project"
+        
+        # Need an active session or create one
+        if not self.current_session_id:
+            # Create a session first
+            try:
+                session = await self.opencode.create_session(title="Open project")
+                self.current_session_id = session["id"]
+            except Exception as e:
+                return f"❌ Could not create session: {str(e)[:200]}"
+        
+        # Check if session is idle, wait up to 10 seconds if busy
+        max_wait_seconds = 10
+        check_interval = 0.5
+        waited = 0
+        
+        while waited < max_wait_seconds:
+            if await self.opencode.is_session_idle(self.current_session_id):
+                break
+            await asyncio.sleep(check_interval)
+            waited += check_interval
+        
+        if not await self.opencode.is_session_idle(self.current_session_id):
+            return "❌ Session is busy. Please wait for current operations to complete and try again."
+
+        # Send cd command via shell
+        import shlex
+        # Expand tilde to home directory to avoid quoting issues
+        expanded_path = os.path.expanduser(args)
+        quoted_path = shlex.quote(expanded_path)
+        shell_cmd = f"cd {quoted_path}"
+        
+        try:
+            # Get current directory before change
+            old_path_info = await self.opencode.get_path()
+            old_path = old_path_info.get("path", "unknown")
+            
+            result: dict[str, Any] = await self.opencode.send_shell(self.current_session_id, shell_cmd)
+            
+            # Check for errors in response
+            parts = result.get("parts", [])
+            error_text = ""
+            
+            for part in parts:
+                if part.get("type") == "text":
+                    text = part.get("text", "")
+                    if "error" in text.lower() or "no such" in text.lower() or "not found" in text.lower():
+                        error_text += text + "\n"
+            
+            if error_text:
+                return f"❌ Failed to open project:\n\n```\n{error_text.strip()}\n```"
+            
+            # Get new directory and project info
+            new_path_info = await self.opencode.get_path()
+            new_path = new_path_info.get("path", "unknown")
+            project = await self.opencode.get_current_project()
+            name = project.get("name", "unnamed")
+            
+            # Update session title to reflect project
+            try:
+                title = name if name != "unnamed" else os.path.basename(new_path.rstrip('/'))
+                await self.opencode.update_session(self.current_session_id, title=f"Project: {title}")
+            except:
+                pass  # Optional, non-critical
+            
+            if new_path != old_path:
+                return f"✅ Opened project in `{new_path}`\n📁 **Project:** {name}\n📝 **Session:** `{self.current_session_id}`\n\nUse `/files` to explore or `/prompt` to start working."
+            else:
+                return f"✅ Opened project in `{new_path}`\n📁 **Project:** {name}\n📝 **Session:** `{self.current_session_id}`"
+            
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400:
+                error_detail = ""
+                try:
+                    error_data = e.response.json()
+                    error_detail = str(error_data).replace("{", "{{").replace("}", "}}")[:150]
+                except:
+                    error_detail = str(e)[:150]
+                return f"❌ Bad request to OpenCode (400):\n\n`{error_detail}`\n\nThis may be due to invalid session state or API changes."
+            elif e.response.status_code == 429:
+                return "❌ Too many requests. Please wait before trying again."
+            elif e.response.status_code == 500:
+                error_detail = ""
+                try:
+                    error_data = e.response.json()
+                    error_msg = error_data.get("data", {}).get("message", str(error_data))
+                    if "is busy" in error_msg:
+                        session_short = self.current_session_id if self.current_session_id else "unknown"
+                        return f"❌ Session is busy. Please wait or use:\n`/abort {session_short}`\n\nOr create a new session with `/session`."
+                    elif "agent.model" in error_msg or "undefined is not an object" in error_msg:
+                        # Try to get list of available agents to suggest valid ones
+                        try:
+                            agents = await self.opencode.list_agents()
+                            agent_names = [a.get("name", "") for a in agents if a.get("name")]
+                            valid_agents = ", ".join([f"`{name}`" for name in agent_names[:5]])
+                            return f"❌ Invalid agent specified. Available agents:\n\n{valid_agents}\n\nTry using a valid agent like `/shell --agent explore <command>`"
+                        except:
+                            return f"❌ Invalid agent configuration. Try using `explore` agent:\n\n`/shell --agent explore <command>`"
+                    error_detail = error_msg[:150]
+                except:
+                    error_detail = str(e)[:150]
+                return f"❌ OpenCode internal server error (500):\n\n`{error_detail}`"
+            else:
+                logger.error(f"HTTP error opening project: {e}")
+                return f"❌ OpenCode server error {e.response.status_code}: {str(e)[:200]}"
+        except Exception as e:
+            logger.error(f"Error opening project: {e}")
+            return f"❌ Error opening project: {str(e)[:200]}"
+
     async def cmd_directory(self, args: str) -> str:
         if not args:
             path_info = await self.opencode.get_path()
@@ -227,7 +341,9 @@ class CommandHandler:
 
         # Send cd command via shell
         import shlex
-        quoted_path = shlex.quote(args)
+        # Expand tilde to home directory to avoid quoting issues
+        expanded_path = os.path.expanduser(args)
+        quoted_path = shlex.quote(expanded_path)
         shell_cmd = f"cd {quoted_path}"
         
         try:
@@ -282,6 +398,15 @@ class CommandHandler:
                     if "is busy" in error_msg:
                         session_short = self.current_session_id[:8] if self.current_session_id else "unknown"
                         return f"❌ Session is busy. Please wait or use:\n`/abort {session_short}`\n\nOr create a new session with `/session`."
+                    elif "agent.model" in error_msg or "undefined is not an object" in error_msg:
+                        # Try to get list of available agents to suggest valid ones
+                        try:
+                            agents = await self.opencode.list_agents()
+                            agent_names = [a.get("name", "") for a in agents if a.get("name")]
+                            valid_agents = ", ".join([f"`{name}`" for name in agent_names[:5]])
+                            return f"❌ Invalid agent specified. Available agents:\n\n{valid_agents}\n\nTry using a valid agent like `/shell --agent explore <command>`"
+                        except:
+                            return f"❌ Invalid agent configuration. Try using `explore` agent:\n\n`/shell --agent explore <command>`"
                     error_detail = error_msg[:150]
                 except:
                     error_detail = str(e)[:150]
@@ -382,7 +507,7 @@ class CommandHandler:
 
         lines = ["📝 *Sessions*"]
         for i, s in enumerate(sessions[:15], 1):  # Limit to 15 sessions
-            session_id = s.get("id", "unknown")[:8]
+            session_id = s.get("id", "unknown")
             title = s.get("title", "Untitled")
             parent_id = s.get("parentID")
             status = status_dict.get(s.get("id", ""), {}).get("type", "unknown")
@@ -396,7 +521,7 @@ class CommandHandler:
         if len(sessions) > 15:
             lines.append(f"\n... and {len(sessions) - 15} more sessions")
 
-        lines.append(f"\n*Current:* `{self.current_session_id[:8] if self.current_session_id else 'None'}`")
+        lines.append(f"\n*Current:* `{self.current_session_id if self.current_session_id else 'None'}`")
         lines.append("Use `/use <id>` to switch sessions")
         return "\n".join(lines)
 
@@ -431,7 +556,7 @@ class CommandHandler:
             busy_count = 0
             idle_count = 0
             for session_id, status in status_dict.items():
-                session_short = session_id[:8]
+                session_short = session_id
                 status_type = status.get("type", "unknown")
                 if status_type == "busy":
                     busy_count += 1
@@ -444,7 +569,7 @@ class CommandHandler:
             return "\n".join(lines)
         else:
             # Show status for specific session
-            session_short = args[:8]
+            session_short = args
             status = status_dict.get(args, {})
             if not status:
                 return f"❌ Session `{session_short}` not found."
@@ -555,6 +680,15 @@ class CommandHandler:
                     if "is busy" in error_msg:
                         session_short = self.current_session_id[:8] if self.current_session_id else "unknown"
                         return f"❌ Session is busy. Please wait or use:\n`/abort {session_short}`\n\nOr create a new session with `/session`."
+                    elif "agent.model" in error_msg or "undefined is not an object" in error_msg:
+                        # Try to get list of available agents to suggest valid ones
+                        try:
+                            agents = await self.opencode.list_agents()
+                            agent_names = [a.get("name", "") for a in agents if a.get("name")]
+                            valid_agents = ", ".join([f"`{name}`" for name in agent_names[:5]])
+                            return f"❌ Invalid agent specified. Available agents:\n\n{valid_agents}\n\nTry using a valid agent like `/shell --agent explore <command>`"
+                        except:
+                            return f"❌ Invalid agent configuration. Try using `explore` agent:\n\n`/shell --agent explore <command>`"
                     error_detail = error_msg[:150]
                 except:
                     error_detail = str(e)[:150]
@@ -722,14 +856,19 @@ class CommandHandler:
             for provider in providers.get("providers", []):
                 provider_id = provider.get("id", "unknown")
                 provider_name = provider.get("name", "Unknown")
-                models = provider.get("models", [])
+                models = provider.get("models", {})
                 if models:
                     lines.append(f"\n**{provider_name}** (`{provider_id}`)")
-                    for model in models[:5]:  # Limit to 5 models per provider
+                    # models might be dict, convert to list of values
+                    if isinstance(models, dict):
+                        model_list = list(models.values())
+                    else:
+                        model_list = models
+                    for model in model_list[:5]:  # Limit to 5 models per provider
                         model_id = model.get("id", "unknown")
                         lines.append(f"  - `{model_id}`")
-                    if len(models) > 5:
-                        lines.append(f"  ... and {len(models) - 5} more models")
+                    if len(model_list) > 5:
+                        lines.append(f"  ... and {len(model_list) - 5} more models")
 
             return "\n".join(lines)
         except Exception as e:
