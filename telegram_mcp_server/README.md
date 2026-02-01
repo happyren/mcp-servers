@@ -104,7 +104,7 @@ This enables:
 
 ---
 
-## Available Tools (17 total)
+## Available Tools (20 total)
 
 ### Messaging
 
@@ -138,6 +138,14 @@ This enables:
 |------|-------------|
 | `telegram_get_queued_messages` | Get messages captured by polling service |
 | `telegram_check_new` | Check for new messages in the queue (returns new messages since last check) |
+
+### Bot Command Management
+
+| Tool | Description |
+|------|-------------|
+| `telegram_set_bot_commands` | Register bot commands with Telegram (makes commands appear in `/` menu) |
+| `telegram_delete_bot_commands` | Delete bot commands for a given scope and language |
+| `telegram_get_bot_commands` | Get currently registered bot commands from Telegram |
 
 ---
 
@@ -210,7 +218,7 @@ When the bridge service is enabled (`--enable-bridge`), you can control OpenCode
 | `/read <path>` | Read file content |
 | `/find <pattern>` | Search for text in files |
 | `/findfile <query>` | Find files by name |
-| `/find-symbol <query>` | Find workspace symbols |
+| `/find-symbol <query>` | Find workspace symbols (alias: `/find_symbol`) |
 | `/projects` | List all projects |
 | `/project` | Get current project info |
 | `/vcs` | Get VCS (git) info |
@@ -242,6 +250,8 @@ When the bridge service is enabled (`--enable-bridge`), you can control OpenCode
 | `/agents` | List available agents |
 | `/login <provider>` | Authenticate with a provider |
 | `/commands` | List all OpenCode slash commands |
+| `/pending` | Show pending questions & permissions |
+| `/set_model` | Set model for session (alias: `/set-model`, `/use-model`, `/use_model`) |
 
 ### System Commands
 
@@ -254,6 +264,20 @@ When the bridge service is enabled (`--enable-bridge`), you can control OpenCode
 | `/dispose` | Dispose current instance |
 
 **Note**: Any message not starting with `/` is sent as a prompt to the current session.
+
+### Bot Command Registration
+
+To make commands appear in Telegram's command menu (when users type `/`), register them using:
+
+```bash
+# Using the utility script
+python set_commands.py
+
+# Or via MCP tool in OpenCode
+telegram_set_bot_commands(scope_type="default", language_code="")
+```
+
+This registers all 38+ commands with Telegram. Commands can be managed per scope (private chats, groups, specific chats) and language.
 
 ---
 

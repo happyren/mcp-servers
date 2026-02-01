@@ -134,9 +134,43 @@ If the config file already exists with other settings, merge the `mcp` section i
    - telegram_get_chat_info
    - telegram_get_chat_member
     - telegram_get_chat_member_count
-    - telegram_set_typing
-    - telegram_get_bot_info
-    - telegram_get_queued_messages
+     - telegram_set_typing
+     - telegram_get_bot_info
+     - telegram_get_queued_messages
+      - telegram_set_bot_commands
+      - telegram_delete_bot_commands
+      - telegram_get_bot_commands
+
+## Step 5: Register Bot Commands (Automatic)
+
+For the best user experience, register the bot commands with Telegram so they appear in the command menu when users type `/`. This can be done automatically by the AI agent:
+
+### Option A: Using the MCP Tool (Recommended for AI Agents)
+```
+Use the telegram_set_bot_commands tool to register all available commands:
+telegram_set_bot_commands(scope_type="default", language_code="")
+```
+
+### Option B: Using the Utility Script
+```bash
+# Activate the virtual environment
+source .venv/bin/activate
+
+# Run the command registration script
+python set_commands.py
+```
+
+### What This Does
+- Registers all 38+ slash commands (from `/help` to `/set_model`) with Telegram
+- Commands will appear in Telegram's command menu when users type `/`
+- Uses the "default" scope (available to all users)
+- Can be customized with different scopes (private chats, groups, specific chats)
+
+### Verification
+After registration:
+1. Open Telegram and start typing `/` in the bot chat
+2. You should see a list of available commands (e.g., `/help`, `/sessions`, `/files`)
+3. Use `/commands` in Telegram to see the full list
 
 ## Telegram Commands
 
