@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "coding-convention": {
+      "type": "local",
+      "command": [
+        "/full/path/to/venv/bin/coding-convention-mcp-server"
+      ],
+      "environment": {
+        "CODING_CONVENTION_STORAGE_PATH": "~/.local/share/coding_convention_mcp_server",
+        "CODING_CONVENTION_STORAGE_TYPE": "sqlite",
+        "CODING_CONVENTION_ANALYSIS_DEPTH": "100"
+      },
+      "enabled": true
+    }
+  }
+}

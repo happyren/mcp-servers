@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "coding-convention": {
+      "command": "coding-convention-mcp-server",
+      "args": [],
+      "env": {
+        "CODING_CONVENTION_STORAGE_PATH": "~/.local/share/coding_convention_mcp_server",
+        "CODING_CONVENTION_STORAGE_TYPE": "sqlite"
+      }
+    }
+  }
+}
