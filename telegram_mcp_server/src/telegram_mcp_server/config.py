@@ -28,6 +28,10 @@ class Settings(BaseSettings):
         default="~/.local/share/telegram_mcp_server",
         description="Directory for queue file storage",
     )
+    commands_set: bool = Field(
+        default=False,
+        description="Whether bot commands have been registered with Telegram. Set to true after running set_bot_commands.",
+    )
 
     class Config:
         env_file = ".env"

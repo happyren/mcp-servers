@@ -75,6 +75,7 @@ class CommandHandler:
 `/help` - Show this help message
 `/info [session_id]` - Get session details
 `/messages [session_id]` - List messages in session
+`/pending` - Show pending questions & permissions
 
 *Use any other text to send as a prompt to the current session.*
         """.strip()
@@ -125,6 +126,7 @@ class CommandHandler:
             "find": self.cmd_find,
             "findfile": self.cmd_findfile,
             "find-symbol": self.cmd_find_symbol,
+            "find_symbol": self.cmd_find_symbol,
             "sessions": self.cmd_sessions,
             "session": self.cmd_session,
             "status": self.cmd_status,
@@ -155,7 +157,10 @@ class CommandHandler:
             "messages": self.cmd_messages,
             "init": self.cmd_init,
             "set-model": self.cmd_set_model,
+            "set_model": self.cmd_set_model,
             "use-model": self.cmd_set_model,  # Alias
+            "use_model": self.cmd_set_model,  # Alias
+            "pending": self.cmd_pending,
         }
 
         handler = handlers.get(command)
@@ -1047,3 +1052,53 @@ class CommandHandler:
 
         # This is informational - the model is set per message
         return f"ℹ️ To use a specific model, include it when sending prompts:\n\n`/prompt <message> --model {args}`\n\nOr create a new session:\n`/session {args}`"
+
+    async def cmd_pending(self, args: str) -> str:
+        """Show pending questions and permissions."""
+        session_id = self.current_session_id
+        
+        lines = ["📋 *Pending Requests*\n"]
+        
+        # Get pending questions
+        try:
+            questions = await self.opencode.list_pending_questions()
+            if session_id:
+                questions = [q for q in questions if q.get("sessionID") == session_id]
+            
+            if questions:
+                lines.append(f"*Questions ({len(questions)}):*")
+                for q in questions[:5]:  # Limit to 5
+                    q_id = q.get("id", "unknown")
+                    q_texts = q.get("questions", [])
+                    header = q_texts[0].get("header", "Question") if q_texts else "Question"
+                    lines.append(f"  • `{q_id[:20]}...` - {header}")
+                if len(questions) > 5:
+                    lines.append(f"  ... and {len(questions) - 5} more")
+                lines.append("")
+            else:
+                lines.append("*Questions:* None pending\n")
+        except Exception as e:
+            lines.append(f"*Questions:* Error fetching: {str(e)[:50]}\n")
+        
+        # Get pending permissions
+        try:
+            permissions = await self.opencode.list_pending_permissions()
+            if session_id:
+                permissions = [p for p in permissions if p.get("sessionID") == session_id]
+            
+            if permissions:
+                lines.append(f"*Permissions ({len(permissions)}):*")
+                for p in permissions[:5]:  # Limit to 5
+                    p_id = p.get("id", "unknown")
+                    permission = p.get("permission", "unknown")
+                    patterns = p.get("patterns", [])
+                    pattern_preview = patterns[0][:30] if patterns else ""
+                    lines.append(f"  • `{p_id[:20]}...` - {permission}: {pattern_preview}")
+                if len(permissions) > 5:
+                    lines.append(f"  ... and {len(permissions) - 5} more")
+            else:
+                lines.append("*Permissions:* None pending")
+        except Exception as e:
+            lines.append(f"*Permissions:* Error fetching: {str(e)[:50]}")
+        
+        return "\n".join(lines)

@@ -210,8 +210,75 @@ class OpenCodeClient:
         response.raise_for_status()
         return True
 
+    async def list_pending_permissions(self) -> list[dict[str, Any]]:
+        """List all pending permission requests across all sessions.
+        
+        Returns a list of PermissionRequest objects:
+        {
+            "id": "permission_xxx",
+            "sessionID": "session_xxx",
+            "permission": "bash",
+            "patterns": ["rm -rf *"],
+            "metadata": {...},
+            "always": [...],
+            "tool": { "messageID": "...", "callID": "..." }
+        }
+        """
+        try:
+            response = await self.client.get(f"{self.base_url}/permission")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"Failed to list pending permissions: {e}")
+            return []
+
+    async def get_pending_permissions(self, session_id: str) -> list[dict[str, Any]]:
+        """Get pending permissions for a specific session.
+        
+        Args:
+            session_id: The session ID to filter permissions for
+            
+        Returns a list of pending permissions for this session.
+        """
+        try:
+            all_permissions = await self.list_pending_permissions()
+            return [p for p in all_permissions if p.get("sessionID") == session_id]
+        except Exception as e:
+            logger.error(f"Failed to get pending permissions for session {session_id}: {e}")
+            return []
+
+    async def reply_to_permission(
+        self,
+        request_id: str,
+        reply: str,
+        message: Optional[str] = None,
+    ) -> bool:
+        """Reply to a permission request.
+        
+        Args:
+            request_id: The permission request ID (e.g., "permission_xxx")
+            reply: One of "once" (allow this time), "always" (remember), or "reject"
+            message: Optional message for rejection (provides feedback to AI)
+            
+        Returns:
+            True if response was successful
+        """
+        try:
+            body: dict[str, Any] = {"reply": reply}
+            if message:
+                body["message"] = message
+            response = await self.client.post(
+                f"{self.base_url}/permission/{request_id}/reply",
+                json=body,
+            )
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reply to permission {request_id}: {e}")
+            return False
+
     async def respond_permission(self, session_id: str, permission_id: str, response: bool, remember: Optional[bool] = None) -> bool:
-        """Respond to a permission request."""
+        """Respond to a permission request (legacy API - use reply_to_permission for new code)."""
         body: dict[str, Any] = {"response": response}
         if remember is not None:
             body["remember"] = remember
@@ -518,7 +585,7 @@ class OpenCodeClient:
                 "parts": [{"type": "text", "text": message}],
                 "model": {"providerID": provider_id, "modelID": model_id},
             },
-            timeout=300.0,  # 5 minute timeout for long responses
+            timeout=600.0,  # 10 minute timeout for long responses
         )
         response.raise_for_status()
         # May return empty on 204
@@ -543,3 +610,134 @@ class OpenCodeClient:
                 text_parts.append(part.get("text", ""))
 
         return "\n".join(text_parts) if text_parts else ""
+
+    async def list_pending_questions(self) -> list[dict[str, Any]]:
+        """List all pending questions across all sessions.
+        
+        Returns a list of QuestionRequest objects:
+        {
+            "id": "question_xxx",
+            "sessionID": "session_xxx", 
+            "questions": [
+                {
+                    "question": "...",
+                    "header": "...",
+                    "options": [{"label": "...", "description": "..."}],
+                    "multiple": false,
+                    "custom": true
+                }
+            ],
+            "tool": { "messageID": "...", "callID": "..." }
+        }
+        """
+        try:
+            response = await self.client.get(f"{self.base_url}/question")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"Failed to list pending questions: {e}")
+            return []
+
+    async def get_pending_questions(self, session_id: str) -> list[dict[str, Any]]:
+        """Get pending questions for a specific session.
+        
+        Args:
+            session_id: The session ID to filter questions for
+            
+        Returns a list of pending questions for this session.
+        """
+        try:
+            all_questions = await self.list_pending_questions()
+            # Filter to only questions for this session
+            return [q for q in all_questions if q.get("sessionID") == session_id]
+        except Exception as e:
+            logger.error(f"Failed to get pending questions for session {session_id}: {e}")
+            return []
+
+    async def respond_to_question(
+        self,
+        request_id: str,
+        answers: list[list[str]],
+    ) -> bool:
+        """Reply to a question request.
+        
+        Args:
+            request_id: The question request ID (e.g., "question_xxx")
+            answers: List of answers, one per question. Each answer is a list of selected labels.
+                     For single-choice: [["Option A"]]
+                     For multi-choice: [["Option A", "Option B"]]
+                     For custom text: [["My custom answer"]]
+            
+        Returns:
+            True if response was successful
+        """
+        try:
+            response = await self.client.post(
+                f"{self.base_url}/question/{request_id}/reply",
+                json={"answers": answers},
+            )
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to respond to question {request_id}: {e}")
+            return False
+
+    async def reject_question(self, request_id: str) -> bool:
+        """Reject/dismiss a question request.
+        
+        Args:
+            request_id: The question request ID
+            
+        Returns:
+            True if rejection was successful
+        """
+        try:
+            response = await self.client.post(
+                f"{self.base_url}/question/{request_id}/reject"
+            )
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reject question {request_id}: {e}")
+            return False
+
+    async def wait_for_session_idle(
+        self,
+        session_id: str,
+        timeout: float = 600.0,
+        poll_interval: float = 2.0,
+    ) -> tuple[bool, str | None]:
+        """Wait for a session to become idle.
+        
+        Args:
+            session_id: The session ID to monitor
+            timeout: Maximum time to wait in seconds
+            poll_interval: Time between status checks
+            
+        Returns:
+            Tuple of (is_idle, status_type)
+            - is_idle: True if session became idle, False if timeout
+            - status_type: The final status type ("idle", "busy", "question", etc.)
+        """
+        import time
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            try:
+                status = await self.get_session_status()
+                session_status = status.get(session_id, {})
+                status_type = session_status.get("type", "idle")
+                
+                if status_type == "idle":
+                    return True, "idle"
+                elif status_type == "question":
+                    # There's a pending question - return so it can be handled
+                    return True, "question"
+                    
+                # Still busy, wait and poll again
+                await asyncio.sleep(poll_interval)
+            except Exception as e:
+                logger.error(f"Error polling session status: {e}")
+                await asyncio.sleep(poll_interval)
+        
+        return False, "timeout"

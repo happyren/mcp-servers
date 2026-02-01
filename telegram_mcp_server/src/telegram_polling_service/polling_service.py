@@ -17,6 +17,7 @@ from typing import Any
 
 from telegram_mcp_server.config import get_settings
 from telegram_mcp_server.telegram_client import TelegramClient
+from telegram_mcp_server.commands import get_bot_commands
 from telegram_mcp_server.errors import logger
 
 # Configure logging
@@ -144,6 +145,14 @@ class TelegramPollingService:
         polling_logger.info(f"Starting Telegram polling service (interval: {poll_interval}s)")
         polling_logger.info(f"Queue file: {self.queue_file}")
         polling_logger.info(f"Data directory: {self.data_dir}")
+
+        # Ensure bot commands are set
+        try:
+            commands = get_bot_commands()
+            await self.client.ensure_commands_set(commands)
+            polling_logger.info(f"Ensured bot commands are set ({len(commands)} commands)")
+        except Exception as e:
+            polling_logger.warning(f"Failed to set bot commands: {e}")
 
         try:
             while self.running:

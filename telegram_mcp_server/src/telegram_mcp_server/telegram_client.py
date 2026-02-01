@@ -141,6 +141,90 @@ class TelegramClient:
         """
         return await self._request_with_retry("getMe")
 
+    async def get_my_commands(self) -> list[dict[str, Any]]:
+        """Get the current list of bot commands.
+
+        Returns:
+            List of bot command dictionaries with 'command' and 'description' keys
+        """
+        result = await self._request_with_retry("getMyCommands")
+        return result if isinstance(result, list) else []
+
+    async def set_my_commands(
+        self,
+        commands: list[dict[str, str]],
+        scope: dict[str, Any] | None = None,
+        language_code: str | None = None,
+    ) -> dict[str, Any]:
+        """Set the list of bot commands.
+
+        Args:
+            commands: List of command dictionaries with 'command' and 'description' keys
+            scope: BotCommandScope object defining the scope of commands. Options:
+                   - {"type": "default"} - Default commands for all users
+                   - {"type": "all_private_chats"} - All private chats
+                   - {"type": "all_group_chats"} - All group/supergroup chats
+                   - {"type": "all_chat_administrators"} - All group admins
+                   - {"type": "chat", "chat_id": <id>} - Specific chat
+                   - {"type": "chat_administrators", "chat_id": <id>} - Admins of specific chat
+                   - {"type": "chat_member", "chat_id": <id>, "user_id": <id>} - Specific user in chat
+            language_code: A two-letter ISO 639-1 language code. If empty, commands apply to all languages.
+
+        Returns:
+            API response (True on success)
+        """
+        params: dict[str, Any] = {"commands": commands}
+        if scope is not None:
+            params["scope"] = scope
+        if language_code is not None:
+            params["language_code"] = language_code
+        return await self._request_with_retry("setMyCommands", params, is_read=False)
+
+    async def delete_my_commands(
+        self,
+        scope: dict[str, Any] | None = None,
+        language_code: str | None = None,
+    ) -> dict[str, Any]:
+        """Delete the list of bot commands for the given scope and language.
+
+        Args:
+            scope: BotCommandScope object defining the scope of commands to delete.
+            language_code: A two-letter ISO 639-1 language code.
+
+        Returns:
+            API response (True on success)
+        """
+        params: dict[str, Any] = {}
+        if scope is not None:
+            params["scope"] = scope
+        if language_code is not None:
+            params["language_code"] = language_code
+        return await self._request_with_retry("deleteMyCommands", params, is_read=False)
+
+    async def ensure_commands_set(self, commands: list[dict[str, str]], force: bool = False) -> bool:
+        """Ensure bot commands are set, only setting if none exist or force=True.
+
+        Args:
+            commands: List of command dictionaries with 'command' and 'description' keys
+            force: If True, set commands even if they already exist
+
+        Returns:
+            True if commands were set, False if already set
+        """
+        from .errors import logger
+        try:
+            existing = await self.get_my_commands()
+            if not existing or force:
+                logger.info(f"Setting bot commands ({len(commands)} commands)")
+                await self.set_my_commands(commands)
+                return True
+            else:
+                logger.debug(f"Bot commands already set ({len(existing)} commands)")
+                return False
+        except Exception as e:
+            logger.warning(f"Failed to ensure bot commands: {e}")
+            return False
+
     async def send_message(
         self,
         chat_id: str | int,

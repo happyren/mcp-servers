@@ -734,6 +734,203 @@ async def telegram_get_bot_info() -> str:
 
 
 @mcp.tool(
+    annotations=ToolAnnotations(title="Set Bot Commands", destructiveHint=True, openWorldHint=True)
+)
+async def telegram_set_bot_commands(
+    scope_type: str = "default",
+    language_code: str = "",
+    chat_id: str | None = None,
+    user_id: int | None = None,
+) -> str:
+    """Set bot commands in Telegram from the commands tracked in /help.
+
+    This registers all available bot commands with Telegram so they appear
+    in the command menu when users type '/'. Commands are sourced from
+    the commands.py module which mirrors the /help command list.
+
+    Args:
+        scope_type: Scope for commands. Options:
+            - "default": Default commands for all users (Recommended)
+            - "all_private_chats": Commands for all private chats
+            - "all_group_chats": Commands for all group/supergroup chats
+            - "all_chat_administrators": Commands for all group admins
+            - "chat": Commands for a specific chat (requires chat_id)
+            - "chat_administrators": Commands for admins of specific chat (requires chat_id)
+            - "chat_member": Commands for specific user in chat (requires chat_id and user_id)
+        language_code: Two-letter ISO 639-1 language code (e.g., "en", "es", "zh").
+            Empty string means commands apply to all languages.
+        chat_id: Chat ID for chat-specific scopes. Required for "chat", "chat_administrators", "chat_member".
+        user_id: User ID for "chat_member" scope.
+
+    Returns:
+        Success message with number of commands set, or error message.
+    """
+    try:
+        from .commands import get_bot_commands
+
+        # Get commands from the tracked list
+        commands = get_bot_commands()
+
+        # Build scope object based on scope_type
+        scope: dict[str, Any] | None = None
+        valid_scopes = [
+            "default",
+            "all_private_chats",
+            "all_group_chats",
+            "all_chat_administrators",
+            "chat",
+            "chat_administrators",
+            "chat_member",
+        ]
+
+        if scope_type not in valid_scopes:
+            return f"Invalid scope_type '{scope_type}'. Valid options: {', '.join(valid_scopes)}"
+
+        if scope_type == "default":
+            scope = {"type": "default"}
+        elif scope_type == "all_private_chats":
+            scope = {"type": "all_private_chats"}
+        elif scope_type == "all_group_chats":
+            scope = {"type": "all_group_chats"}
+        elif scope_type == "all_chat_administrators":
+            scope = {"type": "all_chat_administrators"}
+        elif scope_type == "chat":
+            if not chat_id:
+                return "chat_id is required for 'chat' scope"
+            scope = {"type": "chat", "chat_id": chat_id}
+        elif scope_type == "chat_administrators":
+            if not chat_id:
+                return "chat_id is required for 'chat_administrators' scope"
+            scope = {"type": "chat_administrators", "chat_id": chat_id}
+        elif scope_type == "chat_member":
+            if not chat_id or not user_id:
+                return "Both chat_id and user_id are required for 'chat_member' scope"
+            scope = {"type": "chat_member", "chat_id": chat_id, "user_id": user_id}
+
+        client = get_client()
+        lang_code = language_code if language_code else None
+
+        await client.set_my_commands(
+            commands=commands,
+            scope=scope,
+            language_code=lang_code,
+        )
+
+        scope_desc = f"scope={scope_type}"
+        if chat_id:
+            scope_desc += f", chat_id={chat_id}"
+        if user_id:
+            scope_desc += f", user_id={user_id}"
+        if language_code:
+            scope_desc += f", language={language_code}"
+
+        return (
+            f"Successfully set {len(commands)} bot commands!\n"
+            f"Scope: {scope_desc}\n\n"
+            f"Commands are now visible in Telegram's command menu.\n"
+            f"Note: Set TELEGRAM_COMMANDS_SET=true in your .env to track this status."
+        )
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_set_bot_commands",
+            e,
+            category=ErrorCategory.AUTH,
+            user_message=format_telegram_error(e),
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Delete Bot Commands", destructiveHint=True, openWorldHint=True)
+)
+async def telegram_delete_bot_commands(
+    scope_type: str = "default",
+    language_code: str = "",
+    chat_id: str | None = None,
+) -> str:
+    """Delete bot commands for the given scope and language.
+
+    Args:
+        scope_type: Scope for commands to delete. Same options as set_bot_commands.
+        language_code: Two-letter ISO 639-1 language code. Empty means all languages.
+        chat_id: Chat ID for chat-specific scopes.
+
+    Returns:
+        Success message or error message.
+    """
+    try:
+        scope: dict[str, Any] | None = None
+
+        if scope_type == "default":
+            scope = {"type": "default"}
+        elif scope_type == "all_private_chats":
+            scope = {"type": "all_private_chats"}
+        elif scope_type == "all_group_chats":
+            scope = {"type": "all_group_chats"}
+        elif scope_type == "all_chat_administrators":
+            scope = {"type": "all_chat_administrators"}
+        elif scope_type == "chat":
+            if not chat_id:
+                return "chat_id is required for 'chat' scope"
+            scope = {"type": "chat", "chat_id": chat_id}
+        elif scope_type == "chat_administrators":
+            if not chat_id:
+                return "chat_id is required for 'chat_administrators' scope"
+            scope = {"type": "chat_administrators", "chat_id": chat_id}
+
+        client = get_client()
+        lang_code = language_code if language_code else None
+
+        await client.delete_my_commands(
+            scope=scope,
+            language_code=lang_code,
+        )
+
+        return f"Successfully deleted bot commands for scope={scope_type}"
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_delete_bot_commands",
+            e,
+            category=ErrorCategory.AUTH,
+            user_message=format_telegram_error(e),
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(title="Get Bot Commands", readOnlyHint=True, openWorldHint=True)
+)
+async def telegram_get_bot_commands(
+    scope_type: str = "default",
+    language_code: str = "",
+    chat_id: str | None = None,
+) -> str:
+    """Get the currently registered bot commands from Telegram.
+
+    Args:
+        scope_type: Scope to query. Same options as set_bot_commands.
+        language_code: Two-letter ISO 639-1 language code.
+        chat_id: Chat ID for chat-specific scopes.
+
+    Returns:
+        JSON-formatted list of registered commands, or message if none set.
+    """
+    try:
+        client = get_client()
+        commands = await client.get_my_commands()
+
+        if not commands:
+            return "No bot commands currently registered."
+
+        return json.dumps(commands, indent=2)
+    except Exception as e:
+        return log_and_format_error(
+            "telegram_get_bot_commands",
+            e,
+            category=ErrorCategory.AUTH,
+            user_message=format_telegram_error(e),
+        )
+
+
+@mcp.tool(
     annotations=ToolAnnotations(title="Get Queued Messages", readOnlyHint=True)
 )
 async def telegram_get_queued_messages(

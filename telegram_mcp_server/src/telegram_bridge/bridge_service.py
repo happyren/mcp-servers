@@ -24,6 +24,7 @@ import httpx
 
 from .opencode_client import OpenCodeClient
 from .command_handler import CommandHandler
+from telegram_mcp_server.commands import get_bot_commands
 
 # Configure logging
 logging.basicConfig(
@@ -70,6 +71,60 @@ class TelegramClient:
             )
         response.raise_for_status()
         return response.json()
+
+    async def get_my_commands(self) -> list[dict[str, Any]]:
+        """Get the current list of bot commands."""
+        response = await self.client.post(
+            f"{self.base_url}/getMyCommands"
+        )
+        response.raise_for_status()
+        result = response.json()
+        if result.get("ok"):
+            return result.get("result", [])
+        return []
+
+    async def set_my_commands(self, commands: list[dict[str, str]]) -> dict[str, Any]:
+        """Set the list of bot commands."""
+        response = await self.client.post(
+            f"{self.base_url}/setMyCommands",
+            json={"commands": commands}
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def ensure_commands_set(self, commands: list[dict[str, str]], force: bool = False) -> bool:
+        """Ensure bot commands are set, only setting if none exist or force=True."""
+        try:
+            existing = await self.get_my_commands()
+            if not existing or force:
+                logger.info(f"Setting bot commands ({len(commands)} commands)")
+                await self.set_my_commands(commands)
+                return True
+            else:
+                logger.debug(f"Bot commands already set ({len(existing)} commands)")
+                return False
+        except Exception as e:
+            logger.warning(f"Failed to ensure bot commands: {e}")
+            return False
+
+    async def send_typing(self, chat_id: str | int) -> bool:
+        """Send a typing indicator to a chat.
+        
+        Typing indicator lasts about 5 seconds or until a message is sent.
+        Call this repeatedly for long-running operations.
+        """
+        try:
+            response = await self.client.post(
+                f"{self.base_url}/sendChatAction",
+                json={
+                    "chat_id": chat_id,
+                    "action": "typing",
+                },
+            )
+            return response.status_code == 200
+        except Exception as e:
+            logger.debug(f"Failed to send typing indicator: {e}")
+            return False
 
 
 class TelegramOpenCodeBridge:
@@ -118,6 +173,18 @@ class TelegramOpenCodeBridge:
 
         # Track which messages we've already forwarded
         self.forwarded_ids: set[int] = set()
+        
+        # Track pending questions awaiting Telegram response
+        # Format: {telegram_msg_id: {"request_id": str, "session_id": str, "questions": list, "options": list}}
+        self.pending_questions: dict[int, dict[str, Any]] = {}
+        
+        # Track pending permissions awaiting Telegram response  
+        # Format: {telegram_msg_id: {"request_id": str, "session_id": str, "permission": str, "patterns": list}}
+        self.pending_permissions: dict[int, dict[str, Any]] = {}
+        
+        # Track the chat_id for the current session (for question/permission forwarding)
+        self.current_chat_id: int | None = None
+        
         # Load state (forwarded_ids and session info)
         self._load_state()
 
@@ -137,6 +204,14 @@ class TelegramOpenCodeBridge:
                 # Load all tracked sessions
                 sessions = data.get("sessions", {})
                 self.sessions = {k: tuple(v) for k, v in sessions.items() if len(v) == 2}
+                # Load pending questions
+                pending = data.get("pending_questions", {})
+                self.pending_questions = {int(k): v for k, v in pending.items()}
+                # Load pending permissions
+                pending_perms = data.get("pending_permissions", {})
+                self.pending_permissions = {int(k): v for k, v in pending_perms.items()}
+                # Load current chat_id
+                self.current_chat_id = data.get("current_chat_id")
                 if self.session_id:
                     logger.info(f"Loaded saved session: {self.session_id[:8]}... with model {self.session_model}")
                     self.command_handler.current_session_id = self.session_id
@@ -149,11 +224,17 @@ class TelegramOpenCodeBridge:
         # Convert tuples to lists for JSON serialization
         sessions_serializable = {k: list(v) for k, v in self.sessions.items()}
         session_model_list = list(self.session_model) if self.session_model else None
+        # Convert pending questions/permissions keys to strings for JSON
+        pending_q_serializable = {str(k): v for k, v in self.pending_questions.items()}
+        pending_p_serializable = {str(k): v for k, v in self.pending_permissions.items()}
         data = {
             "forwarded_ids": list(self.forwarded_ids),
             "session_id": self.session_id,
             "session_model": session_model_list,
             "sessions": sessions_serializable,
+            "pending_questions": pending_q_serializable,
+            "pending_permissions": pending_p_serializable,
+            "current_chat_id": self.current_chat_id,
             "last_updated": datetime.now().isoformat(),
         }
         with open(self.bridge_state_file, "w", encoding="utf-8") as f:
@@ -227,7 +308,25 @@ class TelegramOpenCodeBridge:
                 processed_ids.add(msg_id)
                 continue
 
-            # Not a command, process as regular prompt
+            # Check if this is a response to a pending question
+            if chat_id and self.pending_questions:
+                is_question_response = await self._check_for_question_response(text, chat_id)
+                if is_question_response:
+                    logger.info(f"Handled as question response: {text[:50]}...")
+                    self.forwarded_ids.add(msg_id)
+                    processed_ids.add(msg_id)
+                    continue
+
+            # Check if this is a response to a pending permission
+            if chat_id and self.pending_permissions:
+                is_permission_response = await self._check_for_permission_response(text, chat_id)
+                if is_permission_response:
+                    logger.info(f"Handled as permission response: {text[:50]}...")
+                    self.forwarded_ids.add(msg_id)
+                    processed_ids.add(msg_id)
+                    continue
+
+            # Not a command, question response, or permission response - process as regular prompt
             logger.info(f"Processing regular prompt: {text[:50]}...")
 
             # Use requested model or fall back to default
@@ -312,15 +411,25 @@ class TelegramOpenCodeBridge:
 
             try:
                 if self.reply_to_telegram and self.telegram and chat_id:
-                    # Use blocking mode - wait for response and send back to Telegram
+                    # Use non-blocking mode with typing indicator
                     logger.info(f"Sending to OpenCode: {text[:50]}...")
-                    response_text = await self.opencode.send_message_text(
-                        session_id,
-                        prompt,
+                    
+                    # Track current chat_id for question forwarding
+                    self.current_chat_id = chat_id
+                    
+                    response_text = await self._send_with_typing(
+                        session_id=session_id,
+                        prompt=prompt,
+                        chat_id=chat_id,
                         provider_id=provider_id,
                         model_id=model_id,
+                        current_msg_id=msg_id,
                     )
                     logger.info(f"OpenCode response received for message {msg_id}")
+
+                    # Check for any pending questions or permissions after response
+                    await self._handle_pending_questions(session_id, chat_id)
+                    await self._handle_pending_permissions(session_id, chat_id)
 
                     # Always send response back to Telegram, even if empty
                     if not response_text:
@@ -394,6 +503,580 @@ class TelegramOpenCodeBridge:
             self._save_state()
             self._remove_from_queue(processed_ids)
 
+    async def _send_with_typing(
+        self,
+        session_id: str,
+        prompt: str,
+        chat_id: int,
+        provider_id: str,
+        model_id: str,
+        timeout: float = 600.0,
+        current_msg_id: int | None = None,
+    ) -> str:
+        """Send a message to OpenCode while showing typing indicator.
+        
+        This method:
+        1. Sends the prompt to OpenCode (blocking API call)
+        2. Shows typing indicator every 4 seconds while waiting
+        3. Polls for and forwards questions/permissions to Telegram during the wait
+        4. When user responds via Telegram, sends the response back to OpenCode
+        
+        Args:
+            session_id: The OpenCode session ID
+            prompt: The prompt to send
+            chat_id: Telegram chat ID for typing indicator
+            provider_id: AI provider ID
+            model_id: AI model ID
+            timeout: Maximum time to wait for response
+            current_msg_id: The message ID currently being processed (to skip in response checking)
+            
+        Returns:
+            The response text from OpenCode
+        """
+        import time
+        
+        # Create a task for the actual API call
+        async def send_message():
+            return await self.opencode.send_message_text(
+                session_id,
+                prompt,
+                provider_id=provider_id,
+                model_id=model_id,
+            )
+        
+        # Create the send task
+        send_task = asyncio.create_task(send_message())
+        
+        # Keep sending typing indicator while waiting
+        typing_interval = 4.0  # Telegram typing indicator lasts ~5 seconds
+        start_time = time.time()
+        
+        try:
+            while not send_task.done():
+                # Send typing indicator
+                if self.telegram:
+                    await self.telegram.send_typing(chat_id)
+                
+                # Poll for pending questions/permissions and forward to Telegram
+                # This is crucial: OpenCode blocks on permission requests, so we need
+                # to poll and handle them while the API call is pending
+                await self._poll_and_forward_pending(session_id, chat_id)
+                
+                # Check if there are any pending questions/permissions that need responses
+                # and process incoming Telegram messages to respond to them
+                await self._check_telegram_for_responses(chat_id, current_msg_id)
+                
+                # Wait for task or next typing interval
+                try:
+                    # Wait with a short timeout to allow periodic typing updates
+                    result = await asyncio.wait_for(
+                        asyncio.shield(send_task),
+                        timeout=typing_interval
+                    )
+                    return result
+                except asyncio.TimeoutError:
+                    # Task not done yet, continue loop to send another typing indicator
+                    elapsed = time.time() - start_time
+                    if elapsed >= timeout:
+                        send_task.cancel()
+                        raise asyncio.TimeoutError(f"OpenCode response timed out after {timeout}s")
+                    continue
+            
+            # Task completed
+            return await send_task
+            
+        except asyncio.CancelledError:
+            send_task.cancel()
+            raise
+        except Exception as e:
+            if not send_task.done():
+                send_task.cancel()
+            raise
+
+    async def _poll_and_forward_pending(self, session_id: str, chat_id: int) -> None:
+        """Poll for pending questions/permissions and forward them to Telegram.
+        
+        This is called during the typing loop to check if OpenCode is waiting
+        for user input (questions or permissions) and forward those to Telegram.
+        """
+        if not self.telegram:
+            return
+        
+        try:
+            # Check for pending questions
+            questions = await self.opencode.get_pending_questions(session_id)
+            for qr in questions:
+                request_id = qr.get("id")
+                # Check if we've already forwarded this question
+                already_forwarded = any(
+                    pq.get("request_id") == request_id 
+                    for pq in self.pending_questions.values()
+                )
+                if already_forwarded:
+                    continue
+                    
+                formatted = await self._format_question_for_telegram(qr)
+                result = await self.telegram.send_message(chat_id, formatted)
+                
+                if result.get("ok"):
+                    sent_msg = result.get("result", {})
+                    sent_msg_id = sent_msg.get("message_id")
+                    if sent_msg_id:
+                        questions_list = qr.get("questions", [])
+                        first_q = questions_list[0] if questions_list else {}
+                        
+                        self.pending_questions[sent_msg_id] = {
+                            "request_id": request_id,
+                            "session_id": qr.get("sessionID"),
+                            "questions": questions_list,
+                            "options": first_q.get("options", []),
+                            "multiple": first_q.get("multiple", False),
+                            "custom": first_q.get("custom", True) if first_q.get("custom") is not None else True,
+                        }
+                        self._save_state()
+                        logger.info(f"Forwarded question to Telegram during wait (msg_id={sent_msg_id}): {request_id}")
+            
+            # Check for pending permissions
+            permissions = await self.opencode.get_pending_permissions(session_id)
+            for pr in permissions:
+                request_id = pr.get("id")
+                # Check if we've already forwarded this permission
+                already_forwarded = any(
+                    pp.get("request_id") == request_id 
+                    for pp in self.pending_permissions.values()
+                )
+                if already_forwarded:
+                    continue
+                    
+                formatted = await self._format_permission_for_telegram(pr)
+                result = await self.telegram.send_message(chat_id, formatted)
+                
+                if result.get("ok"):
+                    sent_msg = result.get("result", {})
+                    sent_msg_id = sent_msg.get("message_id")
+                    if sent_msg_id:
+                        self.pending_permissions[sent_msg_id] = {
+                            "request_id": request_id,
+                            "session_id": pr.get("sessionID"),
+                            "permission": pr.get("permission"),
+                            "patterns": pr.get("patterns", []),
+                        }
+                        self._save_state()
+                        logger.info(f"Forwarded permission to Telegram during wait (msg_id={sent_msg_id}): {request_id}")
+                        
+        except Exception as e:
+            logger.debug(f"Error polling for pending requests: {e}")
+
+    async def _check_telegram_for_responses(self, chat_id: int, skip_msg_id: int | None = None) -> None:
+        """Check for new Telegram messages that might be responses to pending questions/permissions.
+        
+        This reads from the message queue and processes any responses.
+        
+        Args:
+            chat_id: The Telegram chat ID to check messages for
+            skip_msg_id: A message ID to skip (the message currently being processed)
+        """
+        if not self.pending_questions and not self.pending_permissions:
+            return
+            
+        # Read the queue for new messages
+        queue = self._read_queue()
+        if not queue:
+            return
+        
+        # Look for new messages we haven't processed yet
+        for msg in queue:
+            msg_id = msg.get("message_id")
+            if msg_id is None or msg_id in self.forwarded_ids:
+                continue
+            
+            # Skip the message that triggered the current processing
+            if skip_msg_id is not None and msg_id == skip_msg_id:
+                continue
+            
+            msg_chat_id = msg.get("chat_id")
+            if msg_chat_id != chat_id:
+                continue
+                
+            text = msg.get("text", "")
+            if not text:
+                continue
+            
+            # Skip commands - they'll be processed in main loop
+            if text.startswith("/"):
+                continue
+            
+            # Try to handle as question response
+            if self.pending_questions:
+                is_question_response = await self._check_for_question_response(text, chat_id)
+                if is_question_response:
+                    logger.info(f"Handled question response during wait: {text[:50]}...")
+                    self.forwarded_ids.add(msg_id)
+                    self._save_state()
+                    # Remove from queue
+                    self._remove_from_queue({msg_id})
+                    continue
+            
+            # Try to handle as permission response
+            if self.pending_permissions:
+                is_permission_response = await self._check_for_permission_response(text, chat_id)
+                if is_permission_response:
+                    logger.info(f"Handled permission response during wait: {text[:50]}...")
+                    self.forwarded_ids.add(msg_id)
+                    self._save_state()
+                    # Remove from queue
+                    self._remove_from_queue({msg_id})
+                    continue
+
+    async def _format_question_for_telegram(self, question_request: dict[str, Any]) -> str:
+        """Format an OpenCode QuestionRequest for Telegram display.
+        
+        Args:
+            question_request: QuestionRequest with id, sessionID, questions array
+            
+        Returns:
+            Formatted question string for Telegram
+        """
+        questions = question_request.get("questions", [])
+        if not questions:
+            return "*No questions in request*"
+        
+        all_lines = []
+        
+        for i, q in enumerate(questions):
+            header = q.get("header", "Question")
+            question_text = q.get("question", "Please respond:")
+            options = q.get("options", [])
+            multiple = q.get("multiple", False)
+            custom = q.get("custom", True)
+            
+            if len(questions) > 1:
+                all_lines.append(f"*{i+1}. {header}*")
+            else:
+                all_lines.append(f"*{header}*")
+            all_lines.append("")
+            all_lines.append(question_text)
+            all_lines.append("")
+            
+            if options:
+                all_lines.append("Options:")
+                for j, opt in enumerate(options, 1):
+                    label = opt.get("label", f"Option {j}")
+                    desc = opt.get("description", "")
+                    if desc:
+                        all_lines.append(f"  {j}. {label} - {desc}")
+                    else:
+                        all_lines.append(f"  {j}. {label}")
+            
+            if multiple:
+                all_lines.append("\n(You can select multiple options)")
+            
+            if custom:
+                all_lines.append("\nReply with option number(s) or type your answer:")
+            elif options:
+                all_lines.append("\nReply with option number(s):")
+            
+            if i < len(questions) - 1:
+                all_lines.append("\n---\n")
+        
+        return "\n".join(all_lines)
+
+    async def _handle_pending_questions(self, session_id: str, chat_id: int) -> bool:
+        """Check for and handle pending questions from OpenCode.
+        
+        Args:
+            session_id: The OpenCode session ID
+            chat_id: Telegram chat ID to send questions to
+            
+        Returns:
+            True if there are pending questions, False otherwise
+        """
+        if not self.telegram:
+            return False
+            
+        question_requests = await self.opencode.get_pending_questions(session_id)
+        
+        if not question_requests:
+            return False
+        
+        for qr in question_requests:
+            formatted = await self._format_question_for_telegram(qr)
+            result = await self.telegram.send_message(chat_id, formatted)
+            
+            # Get the sent message ID to track the question
+            if result.get("ok"):
+                sent_msg = result.get("result", {})
+                sent_msg_id = sent_msg.get("message_id")
+                if sent_msg_id:
+                    # Store the question context for response handling
+                    # Get the first question's options for parsing (simplified for single-question requests)
+                    questions = qr.get("questions", [])
+                    first_q = questions[0] if questions else {}
+                    
+                    self.pending_questions[sent_msg_id] = {
+                        "request_id": qr.get("id"),
+                        "session_id": qr.get("sessionID"),
+                        "questions": questions,
+                        # For single-question requests, store first question's options for easy parsing
+                        "options": first_q.get("options", []),
+                        "multiple": first_q.get("multiple", False),
+                        "custom": first_q.get("custom", True) if first_q.get("custom") is not None else True,
+                    }
+                    self._save_state()
+                    request_id = qr.get("id", "unknown")
+                    logger.info(f"Forwarded question to Telegram (msg_id={sent_msg_id}): {request_id[:30] if len(request_id) > 30 else request_id}")
+            else:
+                logger.warning(f"Failed to send question to Telegram: {result}")
+        
+        return True
+
+    async def _check_for_question_response(self, text: str, chat_id: int) -> bool:
+        """Check if an incoming message is a response to a pending question.
+        
+        Args:
+            text: The incoming message text
+            chat_id: The Telegram chat ID
+            
+        Returns:
+            True if the message was handled as a question response, False otherwise
+        """
+        if not self.pending_questions:
+            return False
+        
+        # Get the oldest pending question (FIFO)
+        oldest_q_msg_id = min(self.pending_questions.keys())
+        q_context = self.pending_questions[oldest_q_msg_id]
+        
+        # Parse the user's response
+        options = q_context.get("options", [])
+        custom_allowed = q_context.get("custom", True)
+        
+        answer: list[str] = []
+        
+        # Try to parse as option number(s)
+        text_stripped = text.strip()
+        
+        # Check if user typed a number or comma-separated numbers
+        parts = [p.strip() for p in text_stripped.replace(",", " ").split()]
+        all_numbers = True
+        selected_indices = []
+        
+        for part in parts:
+            try:
+                idx = int(part)
+                if 1 <= idx <= len(options):
+                    selected_indices.append(idx - 1)  # Convert to 0-based
+                else:
+                    all_numbers = False
+                    break
+            except ValueError:
+                all_numbers = False
+                break
+        
+        if all_numbers and selected_indices:
+            # User selected option(s) by number
+            for idx in selected_indices:
+                answer.append(options[idx].get("label", f"Option {idx + 1}"))
+        elif custom_allowed:
+            # User typed a custom response
+            answer = [text_stripped]
+        else:
+            # Not a valid response, don't consume as answer
+            return False
+        
+        # Send the response to OpenCode using the Question API
+        request_id = q_context.get("request_id")
+        
+        if request_id:
+            # The Question API expects answers as list of list of strings
+            # One answer array per question in the request
+            # For now we assume single-question requests
+            success = await self.opencode.respond_to_question(
+                request_id=request_id,
+                answers=[answer],  # Wrap in list for the answers array
+            )
+            
+            if success:
+                logger.info(f"Sent question response to OpenCode: {answer}")
+                # Remove from pending questions
+                del self.pending_questions[oldest_q_msg_id]
+                self._save_state()
+                
+                # Send confirmation to Telegram
+                if self.telegram:
+                    await self.telegram.send_message(
+                        chat_id,
+                        f"✓ Response recorded: {', '.join(answer)}"
+                    )
+                return True
+            else:
+                logger.error("Failed to send question response to OpenCode")
+                if self.telegram:
+                    await self.telegram.send_message(
+                        chat_id,
+                        "❌ Failed to send response to OpenCode. Please try again."
+                    )
+                return False
+        
+        return False
+
+    async def _format_permission_for_telegram(self, permission_request: dict[str, Any]) -> str:
+        """Format an OpenCode PermissionRequest for Telegram display.
+        
+        Args:
+            permission_request: PermissionRequest with id, sessionID, permission, patterns, metadata
+            
+        Returns:
+            Formatted permission request string for Telegram
+        """
+        permission = permission_request.get("permission", "unknown")
+        patterns = permission_request.get("patterns", [])
+        metadata = permission_request.get("metadata", {})
+        
+        lines = ["*🔐 Permission Request*", ""]
+        lines.append(f"Tool: `{permission}`")
+        
+        if patterns:
+            if len(patterns) == 1:
+                lines.append(f"Pattern: `{patterns[0]}`")
+            else:
+                lines.append("Patterns:")
+                for p in patterns[:5]:  # Limit to first 5
+                    lines.append(f"  • `{p}`")
+                if len(patterns) > 5:
+                    lines.append(f"  ... and {len(patterns) - 5} more")
+        
+        # Add relevant metadata (like command for bash)
+        if metadata:
+            if "command" in metadata:
+                cmd = metadata["command"]
+                if len(cmd) > 200:
+                    cmd = cmd[:200] + "..."
+                lines.append(f"\nCommand: `{cmd}`")
+            if "path" in metadata:
+                lines.append(f"Path: `{metadata['path']}`")
+        
+        lines.append("\n*Reply with:*")
+        lines.append("  `y` or `yes` - Allow once")
+        lines.append("  `a` or `always` - Always allow")
+        lines.append("  `n` or `no` - Reject")
+        lines.append("  Any other text - Reject with feedback")
+        
+        return "\n".join(lines)
+
+    async def _handle_pending_permissions(self, session_id: str, chat_id: int) -> bool:
+        """Check for and handle pending permissions from OpenCode.
+        
+        Args:
+            session_id: The OpenCode session ID
+            chat_id: Telegram chat ID to send permissions to
+            
+        Returns:
+            True if there are pending permissions, False otherwise
+        """
+        if not self.telegram:
+            return False
+            
+        permission_requests = await self.opencode.get_pending_permissions(session_id)
+        
+        if not permission_requests:
+            return False
+        
+        for pr in permission_requests:
+            formatted = await self._format_permission_for_telegram(pr)
+            result = await self.telegram.send_message(chat_id, formatted)
+            
+            # Get the sent message ID to track the permission
+            if result.get("ok"):
+                sent_msg = result.get("result", {})
+                sent_msg_id = sent_msg.get("message_id")
+                if sent_msg_id:
+                    self.pending_permissions[sent_msg_id] = {
+                        "request_id": pr.get("id"),
+                        "session_id": pr.get("sessionID"),
+                        "permission": pr.get("permission"),
+                        "patterns": pr.get("patterns", []),
+                    }
+                    self._save_state()
+                    request_id = pr.get("id", "unknown")
+                    logger.info(f"Forwarded permission to Telegram (msg_id={sent_msg_id}): {request_id}")
+            else:
+                logger.warning(f"Failed to send permission to Telegram: {result}")
+        
+        return True
+
+    async def _check_for_permission_response(self, text: str, chat_id: int) -> bool:
+        """Check if an incoming message is a response to a pending permission.
+        
+        Args:
+            text: The incoming message text
+            chat_id: The Telegram chat ID
+            
+        Returns:
+            True if the message was handled as a permission response, False otherwise
+        """
+        if not self.pending_permissions:
+            return False
+        
+        # Get the oldest pending permission (FIFO)
+        oldest_p_msg_id = min(self.pending_permissions.keys())
+        p_context = self.pending_permissions[oldest_p_msg_id]
+        
+        text_lower = text.strip().lower()
+        
+        # Parse the response
+        reply: str | None = None
+        message: str | None = None
+        
+        if text_lower in ("y", "yes", "1", "ok", "allow"):
+            reply = "once"
+        elif text_lower in ("a", "always", "remember"):
+            reply = "always"
+        elif text_lower in ("n", "no", "0", "deny", "reject"):
+            reply = "reject"
+        else:
+            # Treat as rejection with feedback message
+            reply = "reject"
+            message = text.strip()
+        
+        # Send the response to OpenCode
+        request_id = p_context.get("request_id")
+        
+        if request_id:
+            success = await self.opencode.reply_to_permission(
+                request_id=request_id,
+                reply=reply,
+                message=message,
+            )
+            
+            if success:
+                logger.info(f"Sent permission response to OpenCode: {reply}" + (f" with message: {message}" if message else ""))
+                # Remove from pending permissions
+                del self.pending_permissions[oldest_p_msg_id]
+                self._save_state()
+                
+                # Send confirmation to Telegram
+                if self.telegram:
+                    if reply == "once":
+                        await self.telegram.send_message(chat_id, "✓ Permission granted (once)")
+                    elif reply == "always":
+                        await self.telegram.send_message(chat_id, "✓ Permission granted (always)")
+                    elif message:
+                        await self.telegram.send_message(chat_id, f"✓ Permission rejected with feedback")
+                    else:
+                        await self.telegram.send_message(chat_id, "✓ Permission rejected")
+                return True
+            else:
+                logger.error("Failed to send permission response to OpenCode")
+                if self.telegram:
+                    await self.telegram.send_message(
+                        chat_id,
+                        "❌ Failed to send response to OpenCode. Please try again."
+                    )
+                return False
+        
+        return False
+
     async def run(self) -> None:
         """Run the bridge service continuously."""
         self.running = True
@@ -420,6 +1103,15 @@ class TelegramOpenCodeBridge:
             return
 
         logger.info("Connected to OpenCode server")
+
+        # Ensure bot commands are set if Telegram client is available
+        if self.telegram:
+            try:
+                commands = get_bot_commands()
+                await self.telegram.ensure_commands_set(commands)
+                logger.info(f"Ensured bot commands are set ({len(commands)} commands)")
+            except Exception as e:
+                logger.warning(f"Failed to set bot commands: {e}")
 
         try:
             while self.running:
