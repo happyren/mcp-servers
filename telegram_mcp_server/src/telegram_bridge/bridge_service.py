@@ -26,6 +26,12 @@ from .opencode_client import OpenCodeClient
 from .command_handler import CommandHandler, CommandResponse
 from telegram_mcp_server.commands import get_bot_commands
 
+# Performance constants
+QUEUE_CACHE_TTL_SECONDS = 0.5  # Cache queue reads for 500ms
+STATE_SAVE_DEBOUNCE_SECONDS = 1.0  # Debounce state saves by 1 second
+TYPING_POLL_INTERVAL_SECONDS = 2.0  # Typing indicator interval
+PERMISSION_POLL_INTERVAL_SECONDS = 0.5  # Poll for pending requests during waits
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -40,7 +46,7 @@ class TelegramClient:
     def __init__(self, bot_token: str):
         self.bot_token = bot_token
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
-        self.client = httpx.AsyncClient(timeout=30.0)
+        self.client = httpx.AsyncClient(timeout=10.0, limits=httpx.Limits(max_keepalive_connections=5, max_connections=10))
 
     async def close(self):
         await self.client.aclose()
@@ -244,7 +250,7 @@ class TelegramOpenCodeBridge:
         self,
         opencode_url: str = "http://localhost:4096",
         queue_dir: str | None = None,
-        poll_interval: int = 2,
+        poll_interval: float = 1.0,
         reply_to_telegram: bool = True,
         bot_token: str | None = None,
         provider_id: str = "deepseek",
@@ -286,7 +292,7 @@ class TelegramOpenCodeBridge:
         else:
             self.queue_dir = Path("~/.local/share/telegram_mcp_server").expanduser()
 
-        self.queue_file = self.queue_dir / "message_queue.json"
+        self.queue_file = self.queue_dir / "message_inbox.json"
         self.bridge_state_file = self.queue_dir / "bridge_state.json"
 
         # Track which messages we've already forwarded
@@ -302,7 +308,22 @@ class TelegramOpenCodeBridge:
         
         # Track the chat_id for the current session (for question/permission forwarding)
         self.current_chat_id: int | None = None
-        
+
+        # In-memory queue for faster processing (loaded from file on startup)
+        self._in_memory_queue: list[dict[str, Any]] = []
+        self._last_queue_read_time: datetime | None = None
+        self._queue_file_mtime: float = 0.0  # Track file modification time to avoid unnecessary reads
+
+        # Debounced state saving with coalescing
+        self._state_dirty = False
+        self._state_save_task: asyncio.Task | None = None
+        self._last_state_save_time: datetime | None = None
+
+        # Session validation cache to avoid repeated API calls
+        self._session_validated: bool = False
+        self._last_session_validation: datetime | None = None
+        self._session_validation_ttl = 60.0  # Validate session every 60 seconds max
+
         # Load state (forwarded_ids and session info)
         self._load_state()
 
@@ -345,13 +366,10 @@ class TelegramOpenCodeBridge:
     def _save_state(self) -> None:
         """Save bridge state to file (forwarded IDs and session info)."""
         self.queue_dir.mkdir(parents=True, exist_ok=True)
-        # Convert tuples to lists for JSON serialization
         sessions_serializable = {k: list(v) for k, v in self.sessions.items()}
         session_model_list = list(self.session_model) if self.session_model else None
-        # Convert pending questions/permissions keys to strings for JSON
         pending_q_serializable = {str(k): v for k, v in self.pending_questions.items()}
         pending_p_serializable = {str(k): v for k, v in self.pending_permissions.items()}
-        # Convert model cache tuples to lists for JSON
         model_cache_serializable = {k: list(v) for k, v in self.command_handler._model_cache.items()}
         data = {
             "forwarded_ids": list(self.forwarded_ids),
@@ -367,14 +385,32 @@ class TelegramOpenCodeBridge:
         with open(self.bridge_state_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
+    async def _schedule_save_state(self) -> None:
+        """Schedule a state save with debouncing and coalescing.
+        
+        Multiple rapid calls will be coalesced into a single save operation.
+        """
+        self._state_dirty = True
+        if self._state_save_task is None or self._state_save_task.done():
+            self._state_save_task = asyncio.create_task(self._delayed_save())
+
+    async def _delayed_save(self) -> None:
+        """Wait briefly then save state if still dirty.
+        
+        Uses configurable debounce time to batch multiple state changes.
+        """
+        await asyncio.sleep(STATE_SAVE_DEBOUNCE_SECONDS)
+        if self._state_dirty:
+            self._save_state()
+            self._state_dirty = False
+            self._last_state_save_time = datetime.now()
+
     def _set_session_model(self, provider_id: str, model_id: str) -> None:
         """Set the model for the current session (callback for CommandHandler)."""
         self.session_model = (provider_id, model_id)
-        # Also update the sessions dict if we have a session_id
         if self.session_id:
             self.sessions[self.session_id] = (provider_id, model_id)
-        # Persist the change
-        self._save_state()
+        asyncio.create_task(self._schedule_save_state())
         logger.info(f"Session model set to {provider_id}/{model_id}")
 
     def _get_session_model(self) -> tuple[str, str] | None:
@@ -382,21 +418,57 @@ class TelegramOpenCodeBridge:
         return self.session_model
 
     def _read_queue(self) -> list[dict[str, Any]]:
-        """Read messages from queue file."""
+        """Read messages from queue file with intelligent caching.
+        
+        Uses file modification time to avoid unnecessary reads when the file
+        hasn't changed, and caches in memory with a short TTL for rapid access.
+        """
+        now = datetime.now()
+        
+        # Check if we have a valid cache within TTL
+        if (self._in_memory_queue 
+            and self._last_queue_read_time is not None
+            and (now - self._last_queue_read_time).total_seconds() < QUEUE_CACHE_TTL_SECONDS):
+            return self._in_memory_queue
+
         if not self.queue_file.exists():
-            return []
-        try:
-            with open(self.queue_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
+            self._in_memory_queue = []
+            self._last_queue_read_time = now
             return []
 
+        try:
+            # Check file modification time - avoid read if unchanged
+            current_mtime = self.queue_file.stat().st_mtime
+            if current_mtime == self._queue_file_mtime and self._in_memory_queue:
+                self._last_queue_read_time = now
+                return self._in_memory_queue
+            
+            with open(self.queue_file, "r", encoding="utf-8") as f:
+                self._in_memory_queue = json.load(f)
+                self._last_queue_read_time = now
+                self._queue_file_mtime = current_mtime
+                return self._in_memory_queue
+        except (json.JSONDecodeError, FileNotFoundError, OSError):
+            return self._in_memory_queue if self._in_memory_queue else []
+
     def _remove_from_queue(self, message_ids: set[int]) -> None:
-        """Remove processed messages from queue."""
-        queue = self._read_queue()
-        remaining = [msg for msg in queue if msg.get("message_id") not in message_ids]
-        with open(self.queue_file, "w", encoding="utf-8") as f:
-            json.dump(remaining, f, indent=2, ensure_ascii=False)
+        """Remove processed messages from queue.
+        
+        Updates both in-memory cache and file atomically.
+        """
+        # Update in-memory cache first
+        self._in_memory_queue = [
+            msg for msg in self._in_memory_queue 
+            if msg.get("message_id") not in message_ids
+        ]
+        
+        # Write to file
+        try:
+            with open(self.queue_file, "w", encoding="utf-8") as f:
+                json.dump(self._in_memory_queue, f, indent=2, ensure_ascii=False)
+            self._queue_file_mtime = self.queue_file.stat().st_mtime
+        except OSError as e:
+            logger.warning(f"Failed to write queue file: {e}")
 
     def _clear_queue(self) -> int:
         """Clear all messages from the queue.
@@ -404,11 +476,15 @@ class TelegramOpenCodeBridge:
         Returns:
             Number of messages that were cleared.
         """
-        queue = self._read_queue()
-        count = len(queue)
+        count = len(self._in_memory_queue)
         if count > 0:
-            with open(self.queue_file, "w", encoding="utf-8") as f:
-                json.dump([], f)
+            self._in_memory_queue = []
+            try:
+                with open(self.queue_file, "w", encoding="utf-8") as f:
+                    json.dump([], f)
+                self._queue_file_mtime = self.queue_file.stat().st_mtime
+            except OSError as e:
+                logger.warning(f"Failed to clear queue file: {e}")
             logger.info(f"Cleared {count} messages from queue")
         return count
 
@@ -421,17 +497,16 @@ class TelegramOpenCodeBridge:
         Returns:
             Number of messages that were removed.
         """
-        from datetime import datetime, timedelta
+        from datetime import timedelta
         
-        queue = self._read_queue()
-        if not queue:
+        if not self._in_memory_queue:
             return 0
         
         cutoff_time = datetime.now() - timedelta(seconds=max_age_seconds)
-        original_count = len(queue)
+        original_count = len(self._in_memory_queue)
         
         remaining = []
-        for msg in queue:
+        for msg in self._in_memory_queue:
             # Check received_at timestamp
             received_at = msg.get("received_at")
             if received_at:
@@ -459,8 +534,13 @@ class TelegramOpenCodeBridge:
         
         removed_count = original_count - len(remaining)
         if removed_count > 0:
-            with open(self.queue_file, "w", encoding="utf-8") as f:
-                json.dump(remaining, f, indent=2, ensure_ascii=False)
+            self._in_memory_queue = remaining
+            try:
+                with open(self.queue_file, "w", encoding="utf-8") as f:
+                    json.dump(remaining, f, indent=2, ensure_ascii=False)
+                self._queue_file_mtime = self.queue_file.stat().st_mtime
+            except OSError as e:
+                logger.warning(f"Failed to write queue file during cleanup: {e}")
             logger.info(f"Removed {removed_count} old messages from queue (older than {max_age_seconds}s)")
         
         return removed_count
@@ -495,7 +575,7 @@ class TelegramOpenCodeBridge:
                 if msg_id is not None:
                     self.forwarded_ids.add(msg_id)
                     processed_ids.add(msg_id)
-                    self._save_state()
+                    asyncio.create_task(self._schedule_save_state())
                 continue
             
             text = msg.get("text", "")
@@ -508,7 +588,7 @@ class TelegramOpenCodeBridge:
                 logger.debug(f"Skipping message {msg_id} (no text)")
                 self.forwarded_ids.add(msg_id)
                 processed_ids.add(msg_id)
-                self._save_state()
+                asyncio.create_task(self._schedule_save_state())
                 continue
 
             # Sync command handler's session_id with bridge's session_id
@@ -535,7 +615,7 @@ class TelegramOpenCodeBridge:
                 self.session_id = self.command_handler.current_session_id
                 self.forwarded_ids.add(msg_id)
                 processed_ids.add(msg_id)
-                self._save_state()
+                asyncio.create_task(self._schedule_save_state())
                 continue
 
             # Check if this is a response to a pending question
@@ -545,7 +625,7 @@ class TelegramOpenCodeBridge:
                     logger.info(f"Handled as question response: {text[:50]}...")
                     self.forwarded_ids.add(msg_id)
                     processed_ids.add(msg_id)
-                    self._save_state()
+                    asyncio.create_task(self._schedule_save_state())
                     continue
 
             # Note: Permission responses are ONLY handled via inline keyboard callbacks,
@@ -558,8 +638,9 @@ class TelegramOpenCodeBridge:
             provider_id = self.default_provider_id
             model_id = self.default_model_id
 
-            # Handle session management - get or create session
+            # Handle session management - get or create session with caching
             need_new_session = False
+            now = datetime.now()
 
             if not self.session_id:
                 # No current session, try to find an existing one from OpenCode
@@ -567,6 +648,8 @@ class TelegramOpenCodeBridge:
                 existing_session_id = await self.opencode.get_existing_session()
                 if existing_session_id:
                     self.session_id = existing_session_id
+                    self._session_validated = True
+                    self._last_session_validation = now
                     # Check if we have model info for this session from persistence
                     if existing_session_id in self.sessions:
                         self.session_model = self.sessions[existing_session_id]
@@ -581,37 +664,57 @@ class TelegramOpenCodeBridge:
                     need_new_session = True
             else:
                 # We have a session_id loaded from state - validate it still exists in OpenCode
-                # This handles the case when OpenCode restarts and old sessions are gone
-                logger.info(f"Validating saved session {self.session_id[:8]}... against OpenCode...")
-                all_sessions = await self.opencode.list_sessions()
-                session_ids = [str(s.get("id")) for s in all_sessions if s.get("id")]
+                # Use cached validation to avoid API calls on every message
+                should_validate = (
+                    not self._session_validated 
+                    or self._last_session_validation is None
+                    or (now - self._last_session_validation).total_seconds() > self._session_validation_ttl
+                )
+                
+                if should_validate:
+                    logger.info(f"Validating saved session {self.session_id[:8]}... against OpenCode...")
+                    all_sessions = await self.opencode.list_sessions()
+                    session_ids = [str(s.get("id")) for s in all_sessions if s.get("id")]
 
-                if self.session_id not in session_ids:
-                    logger.warning(f"Saved session {self.session_id[:8]}... no longer exists in OpenCode (likely due to restart)")
-                    self.session_id = None
-                    self.session_model = None
-                    # Try to find any existing session
-                    if session_ids:
-                        self.session_id = session_ids[0]
-                        if self.session_id in self.sessions:
-                            self.session_model = self.sessions[self.session_id]
-                            logger.info(f"Using existing OpenCode session: {self.session_id[:8]}... with model {self.session_model[0]}/{self.session_model[1]}")
+                    if self.session_id not in session_ids:
+                        logger.warning(f"Saved session {self.session_id[:8]}... no longer exists in OpenCode (likely due to restart)")
+                        self.session_id = None
+                        self.session_model = None
+                        self._session_validated = False
+                        # Try to find any existing session
+                        if session_ids:
+                            self.session_id = session_ids[0]
+                            self._session_validated = True
+                            self._last_session_validation = now
+                            if self.session_id in self.sessions:
+                                self.session_model = self.sessions[self.session_id]
+                                logger.info(f"Using existing OpenCode session: {self.session_id[:8]}... with model {self.session_model[0]}/{self.session_model[1]}")
+                            else:
+                                self.session_model = (provider_id, model_id)
+                                self.sessions[self.session_id] = (provider_id, model_id)
+                                logger.info(f"Using existing OpenCode session: {self.session_id[:8]}... (model set to {provider_id}/{model_id})")
                         else:
+                            logger.info("No sessions found in OpenCode, will create new one")
+                            need_new_session = True
+                    else:
+                        # Session validated successfully
+                        self._session_validated = True
+                        self._last_session_validation = now
+                        if self.session_model:
+                            current_provider, current_model = self.session_model
+                            logger.debug(f"Session {self.session_id[:8]} validated, using model {current_provider}/{current_model}")
+                        else:
+                            # Session exists but no model info - use default
                             self.session_model = (provider_id, model_id)
                             self.sessions[self.session_id] = (provider_id, model_id)
-                            logger.info(f"Using existing OpenCode session: {self.session_id[:8]}... (model set to {provider_id}/{model_id})")
-                    else:
-                        logger.info("No sessions found in OpenCode, will create new one")
-                        need_new_session = True
-                elif self.session_model:
-                    # Session exists and we have model info
-                    current_provider, current_model = self.session_model
-                    logger.info(f"Reusing saved session {self.session_id[:8]}... with model {current_provider}/{current_model}")
+                            logger.info(f"Reusing saved session {self.session_id[:8]}... (model set to {provider_id}/{model_id})")
                 else:
-                    # Session exists but no model info - use default
-                    self.session_model = (provider_id, model_id)
-                    self.sessions[self.session_id] = (provider_id, model_id)
-                    logger.info(f"Reusing saved session {self.session_id[:8]}... (model set to {provider_id}/{model_id})")
+                    # Use cached session without validation
+                    if self._last_session_validation:
+                        elapsed = (now - self._last_session_validation).total_seconds()
+                        logger.debug(f"Using cached session {self.session_id[:8]}... (validated {elapsed:.0f}s ago)")
+                    else:
+                        logger.debug(f"Using cached session {self.session_id[:8]}...")
 
             if need_new_session:
                 logger.info(f"Creating new session for model {provider_id}/{model_id}...")
@@ -619,6 +722,8 @@ class TelegramOpenCodeBridge:
                 if new_session:
                     self.session_id = new_session["id"]
                     self.session_model = (provider_id, model_id)
+                    self._session_validated = True
+                    self._last_session_validation = now
                     assert self.session_id is not None  # Type safety
                     self.sessions[self.session_id] = (provider_id, model_id)
                     logger.info(f"Created new session: {self.session_id[:8]}... with model {provider_id}/{model_id}")
@@ -670,7 +775,7 @@ class TelegramOpenCodeBridge:
                     await self.telegram.send_message(chat_id, response_text)
                     logger.info(f"Reply sent to Telegram for message {msg_id}")
                     # Persist this session as the last interacted one
-                    self._save_state()
+                    asyncio.create_task(self._schedule_save_state())
                     if self.session_id and self.session_model:
                         logger.info(f"Persisted last interacted session: {self.session_id[:8]}... with model {self.session_model[0]}/{self.session_model[1]}")
                     elif self.session_id:
@@ -683,7 +788,7 @@ class TelegramOpenCodeBridge:
 
                 self.forwarded_ids.add(msg_id)
                 processed_ids.add(msg_id)
-                self._save_state()
+                asyncio.create_task(self._schedule_save_state())
 
             except httpx.HTTPStatusError as e:
                 logger.error(f"HTTP error sending message {msg_id}: {e.response.status_code}")
@@ -713,7 +818,7 @@ class TelegramOpenCodeBridge:
                 # Mark as forwarded to avoid resending
                 self.forwarded_ids.add(msg_id)
                 processed_ids.add(msg_id)
-                self._save_state()
+                asyncio.create_task(self._schedule_save_state())
             except Exception as e:
                 logger.error(f"Error sending message {msg_id} to OpenCode: {e}")
 
@@ -780,7 +885,7 @@ class TelegramOpenCodeBridge:
         send_task = asyncio.create_task(send_message())
         
         # Keep sending typing indicator while waiting
-        typing_interval = 4.0  # Telegram typing indicator lasts ~5 seconds
+        typing_interval = TYPING_POLL_INTERVAL_SECONDS  # Telegram typing indicator lasts ~5 seconds
         start_time = time.time()
         
         try:
@@ -927,6 +1032,64 @@ class TelegramOpenCodeBridge:
             logger.info(f"Session switched to {short_id} via callback")
             return
         
+        # Handle session deletion: delete:session_id
+        if callback_data.startswith("delete:"):
+            session_id = callback_data[7:]  # Remove "delete:" prefix
+            
+            # Get session info before deletion
+            try:
+                session_info = await self.opencode.get_session(session_id)
+                title = session_info.get("title", "Untitled")
+            except Exception:
+                title = "Unknown"
+            
+            short_id = session_id[:8]
+            
+            # Attempt to delete the session
+            try:
+                await self.opencode.delete_session(session_id)
+                
+                # Clear current session if it was deleted
+                if self.session_id == session_id:
+                    self.session_id = None
+                    self.command_handler.current_session_id = None
+                
+                # Answer the callback query
+                if self.telegram and callback_query_id:
+                    await self.telegram.answer_callback_query(
+                        callback_query_id,
+                        f"Deleted session {short_id}"
+                    )
+                
+                # Edit the original message to show confirmation
+                if self.telegram and chat_id and original_message_id:
+                    try:
+                        new_text = f"🗑️ *Deleted session:*\n\n`{short_id}`\n_{title}_"
+                        await self.telegram.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=original_message_id,
+                            text=new_text,
+                            inline_keyboard=None,  # Remove the keyboard
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to edit message after session deletion: {e}")
+                        await self.telegram.send_message(
+                            chat_id,
+                            f"🗑️ Deleted session `{short_id}`"
+                        )
+                
+                asyncio.create_task(self._schedule_save_state())
+                logger.info(f"Session {short_id} deleted via callback")
+            except Exception as e:
+                logger.error(f"Failed to delete session {short_id}: {e}")
+                if self.telegram and callback_query_id:
+                    await self.telegram.answer_callback_query(
+                        callback_query_id,
+                        f"Failed to delete: {str(e)[:50]}",
+                        show_alert=True
+                    )
+            return
+        
         # Handle permission response: perm:y|a|n:request_id
         # Handle question response: q:<request_id_prefix>:<option_index>
         # Delegate to inline handler to avoid code duplication
@@ -1008,7 +1171,7 @@ class TelegramOpenCodeBridge:
                     if success:
                         # Remove from pending permissions
                         del self.pending_permissions[matching_msg_id]
-                        self._save_state()
+                        asyncio.create_task(self._schedule_save_state())
                         
                         # Answer the callback query
                         if self.telegram and callback_query_id:
@@ -1085,7 +1248,7 @@ class TelegramOpenCodeBridge:
                         if success:
                             # Remove from pending questions
                             del self.pending_questions[matching_msg_id]
-                            self._save_state()
+                            asyncio.create_task(self._schedule_save_state())
                             
                             # Answer the callback query
                             if self.telegram and callback_query_id:
@@ -1183,7 +1346,7 @@ class TelegramOpenCodeBridge:
                             "multiple": first_q.get("multiple", False),
                             "custom": first_q.get("custom", True) if first_q.get("custom") is not None else True,
                         }
-                        self._save_state()
+                        asyncio.create_task(self._schedule_save_state())
                         logger.info(f"Forwarded question to Telegram during wait (msg_id={sent_msg_id}): {request_id}")
             
             # Check for pending permissions
@@ -1211,7 +1374,7 @@ class TelegramOpenCodeBridge:
                             "permission": pr.get("permission"),
                             "patterns": pr.get("patterns", []),
                         }
-                        self._save_state()
+                        asyncio.create_task(self._schedule_save_state())
                         logger.info(f"Forwarded permission to Telegram during wait (msg_id={sent_msg_id}): {request_id}")
                         
         except Exception as e:
@@ -1260,7 +1423,7 @@ class TelegramOpenCodeBridge:
                     logger.info(f"Handled callback query during wait: {msg.get('callback_data', '')[:30]}...")
                     self.forwarded_ids.add(msg_id)
                     processed_ids.add(msg_id)
-                    self._save_state()
+                    asyncio.create_task(self._schedule_save_state())
                 continue
                 
             text = msg.get("text", "")
@@ -1278,7 +1441,7 @@ class TelegramOpenCodeBridge:
                     logger.info(f"Handled question response during wait: {text[:50]}...")
                     self.forwarded_ids.add(msg_id)
                     processed_ids.add(msg_id)
-                    self._save_state()
+                    asyncio.create_task(self._schedule_save_state())
                     continue
         
         # Remove processed items from queue
@@ -1391,7 +1554,7 @@ class TelegramOpenCodeBridge:
                         "multiple": first_q.get("multiple", False),
                         "custom": first_q.get("custom", True) if first_q.get("custom") is not None else True,
                     }
-                    self._save_state()
+                    asyncio.create_task(self._schedule_save_state())
                     request_id = qr.get("id", "unknown")
                     logger.info(f"Forwarded question to Telegram (msg_id={sent_msg_id}): {request_id[:30] if len(request_id) > 30 else request_id}")
             else:
@@ -1448,7 +1611,7 @@ class TelegramOpenCodeBridge:
                 logger.info(f"Sent question response to OpenCode: {answer}")
                 # Remove from pending questions
                 del self.pending_questions[oldest_q_msg_id]
-                self._save_state()
+                asyncio.create_task(self._schedule_save_state())
                 
                 # Send confirmation to Telegram
                 if self.telegram:
@@ -1564,7 +1727,7 @@ class TelegramOpenCodeBridge:
                         "permission": pr.get("permission"),
                         "patterns": pr.get("patterns", []),
                     }
-                    self._save_state()
+                    asyncio.create_task(self._schedule_save_state())
                     logger.info(f"Stored pending permission: msg_id={sent_msg_id}, request_id={request_id}")
                     logger.debug(f"pending_permissions now has {len(self.pending_permissions)} entries")
             else:
@@ -1612,7 +1775,7 @@ class TelegramOpenCodeBridge:
             
             # Save state if anything was cleaned up
             if stale_q_msg_ids or stale_p_msg_ids:
-                self._save_state()
+                asyncio.create_task(self._schedule_save_state())
                 logger.info(f"Cleaned up {len(stale_q_msg_ids)} stale questions and {len(stale_p_msg_ids)} stale permissions")
                 
         except Exception as e:
@@ -1749,7 +1912,7 @@ Environment variables:
     parser.add_argument(
         "--queue-dir",
         default=None,
-        help="Directory containing message_queue.json (default: ~/.local/share/telegram_mcp_server)",
+        help="Directory containing message_inbox.json (default: ~/.local/share/telegram_mcp_server)",
     )
     parser.add_argument(
         "--interval",

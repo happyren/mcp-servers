@@ -15,7 +15,7 @@ class OpenCodeClient:
 
     def __init__(self, base_url: str = "http://localhost:4096"):
         self.base_url = base_url.rstrip("/")
-        self.client = httpx.AsyncClient(timeout=300.0)
+        self.client = httpx.AsyncClient(timeout=30.0, limits=httpx.Limits(max_keepalive_connections=5, max_connections=10))
 
     async def close(self):
         await self.client.aclose()

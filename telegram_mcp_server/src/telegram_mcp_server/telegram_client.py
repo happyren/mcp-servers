@@ -11,8 +11,8 @@ from .errors import logger
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 3
-INITIAL_RETRY_DELAY = 1.0
-MAX_RETRY_DELAY = 60.0
+INITIAL_RETRY_DELAY = 0.1
+MAX_RETRY_DELAY = 5.0
 
 
 @dataclass
@@ -51,7 +51,8 @@ class TelegramClient:
         self._last_update_id: int | None = None
         self._max_retries = max_retries
         self._retry_delay = retry_delay
-        self._client = httpx.AsyncClient(timeout=60.0)
+        # Use 60s timeout to support long polling (30s) with margin
+        self._client = httpx.AsyncClient(timeout=60.0, limits=httpx.Limits(max_keepalive_connections=5, max_connections=10))
         self._bot_user_id: int | None = None
 
     async def close(self) -> None:
@@ -211,7 +212,6 @@ class TelegramClient:
         Returns:
             True if commands were set, False if already set
         """
-        from .errors import logger
         try:
             existing = await self.get_my_commands()
             if not existing or force:
@@ -454,7 +454,7 @@ class TelegramClient:
         self,
         offset: int | None = None,
         limit: int = 100,
-        timeout: int = 30,
+        timeout: int = 2,
         allowed_updates: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Get updates (new messages) from Telegram.
@@ -710,7 +710,7 @@ class TelegramClient:
         self,
         offset: int | None = None,
         limit: int = 100,
-        timeout: int = 30,
+        timeout: int = 2,
     ) -> list[dict[str, Any]]:
         """Get updates including callback queries (button clicks).
 

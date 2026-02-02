@@ -113,7 +113,7 @@ class CommandHandler:
 🛠️ *Session Management*
 `/fork <session_id>` - Fork session
 `/abort <session_id>` - Abort running session
-`/delete <session_id>` - Delete session
+`/delete` - Delete session (tap to select)
 `/share <session_id>` - Share session
 `/unshare <session_id>` - Unshare session
 `/revert <message_id>` - Revert a message
@@ -566,11 +566,12 @@ class CommandHandler:
         return "\n".join(lines)
 
     async def cmd_sessions(self, args: str) -> Union[str, CommandResponse]:
-        sessions = await self.opencode.list_sessions()
+        sessions, status_dict = await asyncio.gather(
+            self.opencode.list_sessions(),
+            self.opencode.get_session_status()
+        )
         if not sessions:
             return "No sessions found. Use `/session` to create one."
-
-        status_dict = await self.opencode.get_session_status()
 
         keyboard: list[list[dict[str, str]]] = []
         seen_ids: set[str] = set()  # Deduplicate sessions
@@ -831,10 +832,42 @@ class CommandHandler:
         except Exception as e:
             return f"❌ Error aborting session: {str(e)}"
 
-    async def cmd_delete(self, args: str) -> str:
+    async def cmd_delete(self, args: str) -> Union[str, CommandResponse]:
+        # If no args, show session list with delete buttons
         if not args:
-            return "❌ Usage: `/delete <session_id>`"
+            sessions = await self.opencode.list_sessions()
+            if not sessions:
+                return "No sessions to delete."
+            
+            keyboard: list[list[dict[str, str]]] = []
+            seen_ids: set[str] = set()
+            
+            for s in sessions[:15]:
+                session_id = s.get("id", "unknown")
+                if session_id in seen_ids:
+                    continue
+                seen_ids.add(session_id)
+                
+                title = s.get("title", "Untitled")
+                short_title = title[:25] + "..." if len(title) > 28 else title
+                short_id = session_id[:8]
+                
+                # Skip current session - don't allow deleting it
+                if session_id == self.current_session_id:
+                    continue
+                
+                keyboard.append([{
+                    "text": f"🗑️ {short_id} - {short_title}",
+                    "callback_data": f"delete:{session_id}"
+                }])
+            
+            if not keyboard:
+                return "No sessions available to delete (current session cannot be deleted)."
+            
+            text = f"🗑️ *Delete Session*\n\nTap to delete:"
+            return CommandResponse(text=text, keyboard=keyboard)
 
+        # Direct delete with session ID
         try:
             await self.opencode.delete_session(args)
             if self.current_session_id == args:

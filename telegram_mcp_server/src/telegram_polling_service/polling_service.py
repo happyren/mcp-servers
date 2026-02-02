@@ -40,7 +40,7 @@ class TelegramPollingService:
 
         queue_dir = Path(self.settings.queue_dir).expanduser()
         self.data_dir = queue_dir
-        self.queue_file = queue_dir / "message_queue.json"
+        self.queue_file = queue_dir / "message_inbox.json"
         self.offset_file = queue_dir / "polling_offset.json"
         self.running = False
 
@@ -53,6 +53,7 @@ class TelegramPollingService:
 
     def _write_queue(self, messages: list[dict[str, Any]]) -> None:
         """Write messages to queue file."""
+        loop = asyncio.get_event_loop()
         with open(self.queue_file, "w", encoding="utf-8") as f:
             json.dump(messages, f, indent=2, ensure_ascii=False)
 
@@ -88,6 +89,8 @@ class TelegramPollingService:
     async def poll_once(self) -> None:
         """Poll Telegram once for new messages using proper offset."""
         try:
+            # Use get_updates_with_callbacks to get both messages and button clicks
+            # Long polling with 30s timeout - returns immediately when message arrives
             updates = await self.client.get_updates_with_callbacks(
                 offset=self.last_offset,
                 limit=100,
@@ -165,7 +168,7 @@ class TelegramPollingService:
         except Exception as e:
             polling_logger.error(f"Error polling Telegram: {e}")
 
-    async def run(self, poll_interval: int = 2) -> None:
+    async def run(self, poll_interval: int = 0) -> None:
         """Run polling service continuously."""
         self.running = True
 
@@ -203,7 +206,7 @@ class TelegramPollingService:
 async def async_main():
     """Async entry point."""
     service = TelegramPollingService()
-    await service.run(poll_interval=2)
+    await service.run(poll_interval=0)  # No sleep needed - long polling handles waiting
 
 
 def main():

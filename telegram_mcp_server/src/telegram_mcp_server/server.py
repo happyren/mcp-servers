@@ -33,10 +33,13 @@ _settings: Settings | None = None
 
 
 def get_queue_file_path() -> Path:
-    """Get queue file path from settings."""
+    """Get queue file path from settings.
+    
+    This returns the inbox file path where the polling service stores messages.
+    """
     settings = get_settings()
     queue_dir = Path(settings.queue_dir).expanduser()
-    return queue_dir / "message_queue.json"
+    return queue_dir / "message_inbox.json"
 
 
 QUEUE_FILE_PATH = get_queue_file_path()
@@ -201,7 +204,7 @@ async def telegram_send_summary(
     annotations=ToolAnnotations(title="Receive Messages", readOnlyHint=True, openWorldHint=True)
 )
 async def telegram_receive_messages(
-    timeout: int = 5,
+    timeout: int = 2,
     from_user_id: str | None = None,
 ) -> str:
     """Check for and receive new messages from Telegram.
@@ -980,7 +983,9 @@ def run_polling_service():
         try:
             while not _shutdown_event.is_set():
                 await service.poll_once()
-                await asyncio.sleep(1)  # Poll every 1 second for fast response
+                # Short sleep - long polling already waits for messages
+                # Just a brief pause to avoid tight loop if Telegram returns immediately
+                await asyncio.sleep(0.1)
         except Exception as e:
             logger.error(f"Polling service error: {e}")
         finally:
@@ -1012,7 +1017,7 @@ def run_bridge_service(
         bridge = TelegramOpenCodeBridge(
             opencode_url=opencode_url,
             queue_dir=settings.queue_dir,
-            poll_interval=2,
+            poll_interval=0.5,  # Fast polling - queue caching handles efficiency
             reply_to_telegram=reply_to_telegram,
             bot_token=settings.bot_token,
             provider_id=provider_id,

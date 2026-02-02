@@ -34,7 +34,7 @@ def get_bot_commands() -> List[Dict[str, str]]:
         {"command": "todo", "description": "Get todo list"},
         {"command": "fork", "description": "Fork session"},
         {"command": "abort", "description": "Abort running session"},
-        {"command": "delete", "description": "Delete session"},
+        {"command": "delete", "description": "Delete session (tap to select)"},
         {"command": "share", "description": "Share session"},
         {"command": "unshare", "description": "Unshare session"},
         {"command": "revert", "description": "Revert a message"},
