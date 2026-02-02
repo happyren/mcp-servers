@@ -103,9 +103,8 @@ class CommandHandler:
 
 📝 *Sessions*
 `/session [model]` - Create new session (optional: with model)
-`/sessions` - List all sessions
+`/sessions` - List all sessions (tap to switch)
 `/status` - Get session status
-`/use <id>` - Switch to session
 `/prompt <message>` - Send prompt to current session
 `/shell <command>` - Execute shell command
 `/diff [session_id]` - Get session diff
@@ -195,8 +194,6 @@ class CommandHandler:
             "sessions": self.cmd_sessions,
             "session": self.cmd_session,
             "status": self.cmd_status,
-            "use": self.cmd_use,
-            "switch": self.cmd_use,  # Alias
             "prompt": self.cmd_prompt,
             "shell": self.cmd_shell,
             "diff": self.cmd_diff,
@@ -393,7 +390,7 @@ class CommandHandler:
 
         # Need an active session to change directory
         if not self.current_session_id:
-            return "❌ No active session. Use `/session` to create one or `/use <id>` to select one first."
+            return "❌ No active session. Use `/session` to create one or `/sessions` to select one first."
 
         # Check if session is idle, wait up to 10 seconds if busy
         max_wait_seconds = 10
@@ -575,11 +572,17 @@ class CommandHandler:
 
         status_dict = await self.opencode.get_session_status()
 
-        lines = ["📝 *Sessions*\n"]
         keyboard: list[list[dict[str, str]]] = []
+        seen_ids: set[str] = set()  # Deduplicate sessions
         
-        for i, s in enumerate(sessions[:15], 1):  # Limit to 15 sessions
+        for s in sessions[:15]:  # Limit to 15 sessions
             session_id = s.get("id", "unknown")
+            
+            # Skip duplicates
+            if session_id in seen_ids:
+                continue
+            seen_ids.add(session_id)
+            
             title = s.get("title", "Untitled")
             parent_id = s.get("parentID")
             status = status_dict.get(s.get("id", ""), {}).get("type", "unknown")
@@ -599,13 +602,11 @@ class CommandHandler:
                 "callback_data": f"session:{session_id}"
             }])
         
-        if len(sessions) > 15:
-            lines.append(f"_... and {len(sessions) - 15} more sessions_\n")
-
-        lines.append(f"*Current:* `{self.current_session_id[:8] if self.current_session_id else 'None'}`")
-        lines.append("\nTap a session to switch to it.")
+        # Minimal text - just header and current session
+        current = self.current_session_id[:8] if self.current_session_id else "None"
+        text = f"📝 *Sessions* ({len(seen_ids)})\n\nCurrent: `{current}`\nTap to switch:"
         
-        return CommandResponse(text="\n".join(lines), keyboard=keyboard)
+        return CommandResponse(text=text, keyboard=keyboard)
 
     async def cmd_session(self, args: str) -> str:
         # Parse optional model
@@ -628,11 +629,11 @@ class CommandHandler:
             # If model specified with provider, set it via callback
             if provider and model and self._set_model_callback:
                 self._set_model_callback(provider, model)
-                return f"✅ Created new session `{short_id}` using model `{provider}/{model}`\n\nUse `/use <id>` to switch sessions later."
+                return f"✅ Created new session `{short_id}` using model `{provider}/{model}`"
             elif model and not provider:
                 return f"✅ Created new session `{short_id}`\n\n⚠️ Model `{model}` specified without provider.\nUse `/set-model <provider>/{model}` to set the model."
             else:
-                return f"✅ Created new session `{short_id}`\n\nUse `/use <id>` to switch sessions later."
+                return f"✅ Created new session `{short_id}`"
         except Exception as e:
             return f"❌ Failed to create session: {str(e)}"
 
@@ -666,34 +667,12 @@ class CommandHandler:
             status_type = status.get("type", "unknown")
             return f"📊 *Session `{session_short}` Status*\n\nStatus: **{status_type}**"
 
-    async def cmd_use(self, args: str) -> str:
-        if not args:
-            return "❌ Usage: `/use <session_id>`"
-
-        sessions = await self.opencode.list_sessions()
-        session_ids = [sid for s in sessions if (sid := s.get("id"))]
-
-        # Try exact match first
-        if args in session_ids:
-            self.current_session_id = args
-            return f"✅ Switched to session `{args[:8]}`"
-
-        # Try partial match
-        matching = [sid for sid in session_ids if sid.startswith(args)]
-        if len(matching) == 1:
-            self.current_session_id = matching[0]
-            return f"✅ Switched to session `{matching[0][:8]}`"
-        elif len(matching) > 1:
-            return f"⚠️ Multiple sessions match. Please use full session ID:\n" + "\n".join([f"- `{s[:8]}`" for s in matching[:5]])
-        else:
-            return f"❌ Session not found: `{args}`"
-
     async def cmd_prompt(self, args: str) -> str:
         if not args:
             return "❌ Usage: `/prompt <message>`"
 
         if not self.current_session_id:
-            return "❌ No active session. Use `/session` to create one or `/use <id>` to select one."
+            return "❌ No active session. Use `/session` to create one or `/sessions` to select one."
 
         try:
             result: dict[str, Any] = await self.opencode.send_message(self.current_session_id, args)
@@ -719,7 +698,7 @@ class CommandHandler:
             return "❌ Usage: `/shell <command>`"
 
         if not self.current_session_id:
-            return "❌ No active session. Use `/session` to create one or `/use <id>` to select one."
+            return "❌ No active session. Use `/session` to create one or `/sessions` to select one."
 
         # Check if session is idle, wait up to 10 seconds if busy
         max_wait_seconds = 10
@@ -897,7 +876,7 @@ class CommandHandler:
             part_id = parts[1].strip() if len(parts) > 1 else None
 
         if not self.current_session_id:
-            return "❌ No active session. Use `/use <id>` to select one."
+            return "❌ No active session. Use `/sessions` to select one."
 
         try:
             await self.opencode.revert_message(self.current_session_id, args, part_id)
@@ -1121,7 +1100,7 @@ class CommandHandler:
 
     async def cmd_init(self, args: str) -> str:
         if not self.current_session_id:
-            return "❌ No active session. Use `/use <id>` to select one."
+            return "❌ No active session. Use `/sessions` to select one."
 
         # Need a message ID to init, we'll use the last message
         try:

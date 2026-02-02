@@ -928,17 +928,57 @@ class TelegramOpenCodeBridge:
             return
         
         # Handle permission response: perm:y|a|n:request_id
+        # Handle question response: q:<request_id_prefix>:<option_index>
+        # Delegate to inline handler to avoid code duplication
+        if callback_data.startswith("perm:") or callback_data.startswith("q:"):
+            handled = await self._handle_callback_query_inline(msg)
+            if handled:
+                return
+        
+        # Unknown callback data
+        logger.warning(f"Unknown callback data: {callback_data}")
+        if self.telegram and callback_query_id:
+            await self.telegram.answer_callback_query(
+                callback_query_id,
+                "Unknown action",
+                show_alert=False
+            )
+
+    async def _handle_callback_query_inline(self, msg: dict[str, Any]) -> bool:
+        """Handle a callback query inline during the typing loop.
+        
+        This is a focused version of _handle_callback_query that ONLY handles
+        permission and question callbacks - the ones that need to be processed
+        while OpenCode is blocked waiting for user input.
+        
+        Args:
+            msg: The callback query message from the queue
+            
+        Returns:
+            True if the callback was handled, False if it should be handled by the main loop
+        """
+        callback_data = msg.get("callback_data", "")
+        callback_query_id = msg.get("callback_query_id", "")
+        chat_id = msg.get("chat_id")
+        original_message_id = msg.get("original_message_id")
+        
+        if not callback_data or callback_data == "ignore":
+            # Answer empty/ignore callbacks
+            if self.telegram and callback_query_id:
+                await self.telegram.answer_callback_query(callback_query_id)
+            return True
+        
+        # Only handle permission and question callbacks inline
+        # Model selection and session selection should go through normal flow
+        
+        # Handle permission response: perm:y|a|n:request_id
         if callback_data.startswith("perm:"):
             parts = callback_data.split(":", 2)
-            logger.debug(f"Permission callback parts: {parts}")
             if len(parts) >= 3:
                 action = parts[1]  # y, a, or n
                 request_id_prefix = parts[2]
                 
-                logger.info(f"Permission callback: action={action}, request_id_prefix='{request_id_prefix}'")
-                logger.info(f"Pending permissions ({len(self.pending_permissions)}): {list(self.pending_permissions.keys())}")
-                for msg_id, ctx in self.pending_permissions.items():
-                    logger.info(f"  msg_id={msg_id}, request_id='{ctx.get('request_id', '')}'")
+                logger.info(f"Inline handling permission callback: action={action}, request_id_prefix='{request_id_prefix}'")
                 
                 # Find the matching pending permission
                 matching_msg_id = None
@@ -948,17 +988,16 @@ class TelegramOpenCodeBridge:
                     if stored_request_id.startswith(request_id_prefix):
                         matching_msg_id = msg_id
                         matching_context = p_context
-                        logger.info(f"Found match: msg_id={msg_id}")
                         break
                 
                 if matching_context and matching_msg_id is not None:
-                    # Map action to reply (OpenCode expects "once", "always", or "reject")
+                    # Map action to reply
                     action_map = {"y": "once", "a": "always", "n": "reject"}
                     reply = action_map.get(action, "reject")
                     action_text = {"y": "Allowed", "a": "Always allowed", "n": "Rejected"}.get(action, "Rejected")
                     
                     full_request_id = matching_context.get("request_id", "")
-                    logger.info(f"Sending permission response: request_id={full_request_id}, reply={reply}")
+                    logger.info(f"Sending permission response inline: request_id={full_request_id}, reply={reply}")
                     
                     # Send permission response to OpenCode
                     success = await self.opencode.reply_to_permission(
@@ -987,31 +1026,31 @@ class TelegramOpenCodeBridge:
                                     chat_id=chat_id,
                                     message_id=original_message_id,
                                     text=new_text,
-                                    inline_keyboard=None,  # Remove the keyboard
+                                    inline_keyboard=None,
                                 )
                             except Exception as e:
                                 logger.warning(f"Failed to edit message after permission response: {e}")
                         
-                        logger.info(f"Permission response sent: {reply}")
-                        return
+                        logger.info(f"Permission response sent inline: {reply}")
+                        return True
                     else:
-                        logger.error("Failed to send permission response to OpenCode")
+                        logger.error("Failed to send permission response to OpenCode inline")
                         if self.telegram and callback_query_id:
                             await self.telegram.answer_callback_query(
                                 callback_query_id,
                                 "Failed to send response",
                                 show_alert=True
                             )
-                        return
+                        return True  # Still mark as handled to avoid double-processing
                 else:
-                    logger.warning(f"No matching pending permission for: {request_id_prefix}")
+                    logger.warning(f"No matching pending permission for inline: {request_id_prefix}")
                     if self.telegram and callback_query_id:
                         await self.telegram.answer_callback_query(
                             callback_query_id,
                             "Permission request expired",
                             show_alert=True
                         )
-                    return
+                    return True
         
         # Handle question response: q:<request_id_prefix>:<option_index>
         if callback_data.startswith("q:"):
@@ -1040,7 +1079,7 @@ class TelegramOpenCodeBridge:
                         # Send question response to OpenCode
                         success = await self.opencode.respond_to_question(
                             request_id=matching_context.get("request_id", ""),
-                            answers=[[selected_label]],  # Wrap in list for the answers array
+                            answers=[[selected_label]],
                         )
                         
                         if success:
@@ -1063,49 +1102,43 @@ class TelegramOpenCodeBridge:
                                         chat_id=chat_id,
                                         message_id=original_message_id,
                                         text=new_text,
-                                        inline_keyboard=None,  # Remove the keyboard
+                                        inline_keyboard=None,
                                     )
                                 except Exception as e:
                                     logger.warning(f"Failed to edit message after question response: {e}")
                             
-                            logger.info(f"Question response sent: {selected_label}")
-                            return
+                            logger.info(f"Question response sent inline: {selected_label}")
+                            return True
                         else:
-                            logger.error("Failed to send question response to OpenCode")
+                            logger.error("Failed to send question response to OpenCode inline")
                             if self.telegram and callback_query_id:
                                 await self.telegram.answer_callback_query(
                                     callback_query_id,
                                     "Failed to send response",
                                     show_alert=True
                                 )
-                            return
+                            return True
                     else:
-                        logger.warning(f"Invalid option index {option_index} for question")
+                        logger.warning(f"Invalid option index {option_index} for question inline")
                         if self.telegram and callback_query_id:
                             await self.telegram.answer_callback_query(
                                 callback_query_id,
                                 "Invalid option",
                                 show_alert=True
                             )
-                        return
+                        return True
                 else:
-                    logger.warning(f"No matching pending question for: {request_id_prefix}")
+                    logger.warning(f"No matching pending question for inline: {request_id_prefix}")
                     if self.telegram and callback_query_id:
                         await self.telegram.answer_callback_query(
                             callback_query_id,
                             "Question expired",
                             show_alert=True
                         )
-                    return
+                    return True
         
-        # Unknown callback data
-        logger.warning(f"Unknown callback data: {callback_data}")
-        if self.telegram and callback_query_id:
-            await self.telegram.answer_callback_query(
-                callback_query_id,
-                "Unknown action",
-                show_alert=False
-            )
+        # Not a permission or question callback - let main loop handle it
+        return False
 
     async def _poll_and_forward_pending(self, session_id: str, chat_id: int) -> None:
         """Poll for pending questions/permissions and forward them to Telegram.
@@ -1185,9 +1218,10 @@ class TelegramOpenCodeBridge:
             logger.debug(f"Error polling for pending requests: {e}")
 
     async def _check_telegram_for_responses(self, chat_id: int, skip_msg_id: int | None = None) -> None:
-        """Check for new Telegram messages that might be responses to pending questions/permissions.
+        """Check for new Telegram messages and callback queries that are responses to pending questions/permissions.
         
         This reads from the message queue and processes any responses.
+        Critically, this handles BOTH text messages AND callback queries (button clicks).
         
         Args:
             chat_id: The Telegram chat ID to check messages for
@@ -1196,12 +1230,14 @@ class TelegramOpenCodeBridge:
         if not self.pending_questions and not self.pending_permissions:
             return
             
-        # Read the queue for new messages
+        # Read the queue for new messages/callbacks
         queue = self._read_queue()
         if not queue:
             return
         
-        # Look for new messages we haven't processed yet
+        processed_ids: set[int] = set()
+        
+        # Look for new messages/callbacks we haven't processed yet
         for msg in queue:
             msg_id = msg.get("message_id")
             if msg_id is None or msg_id in self.forwarded_ids:
@@ -1213,6 +1249,18 @@ class TelegramOpenCodeBridge:
             
             msg_chat_id = msg.get("chat_id")
             if msg_chat_id != chat_id:
+                continue
+            
+            msg_type = msg.get("type", "message")
+            
+            # Handle callback queries (button clicks) - CRITICAL for permission responses
+            if msg_type == "callback_query":
+                handled = await self._handle_callback_query_inline(msg)
+                if handled:
+                    logger.info(f"Handled callback query during wait: {msg.get('callback_data', '')[:30]}...")
+                    self.forwarded_ids.add(msg_id)
+                    processed_ids.add(msg_id)
+                    self._save_state()
                 continue
                 
             text = msg.get("text", "")
@@ -1229,12 +1277,13 @@ class TelegramOpenCodeBridge:
                 if is_question_response:
                     logger.info(f"Handled question response during wait: {text[:50]}...")
                     self.forwarded_ids.add(msg_id)
+                    processed_ids.add(msg_id)
                     self._save_state()
-                    # Remove from queue
-                    self._remove_from_queue({msg_id})
                     continue
-            
-            # Note: Permission responses are only handled via inline keyboard callbacks
+        
+        # Remove processed items from queue
+        if processed_ids:
+            self._remove_from_queue(processed_ids)
 
     async def _format_question_for_telegram(self, question_request: dict[str, Any]) -> tuple[str, list[list[dict[str, str]]]]:
         """Format an OpenCode QuestionRequest for Telegram display.
@@ -1283,7 +1332,7 @@ class TelegramOpenCodeBridge:
                 callback_data = f"q:{request_id[:45]}:{j}"
                 keyboard.append([{"text": f"{j+1}. {label}", "callback_data": callback_data}])
             
-            # Note: No text hint - users MUST use the keyboard buttons
+            # Hint for users to tap buttons
             all_lines.append("")
             all_lines.append("_Tap a button above to respond._")
         
