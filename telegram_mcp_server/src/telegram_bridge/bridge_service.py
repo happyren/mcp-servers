@@ -23,7 +23,7 @@ from typing import Any
 import httpx
 
 from .opencode_client import OpenCodeClient
-from .command_handler import CommandHandler
+from .command_handler import CommandHandler, CommandResponse
 from telegram_mcp_server.commands import get_bot_commands
 
 # Configure logging
@@ -126,6 +126,116 @@ class TelegramClient:
             logger.debug(f"Failed to send typing indicator: {e}")
             return False
 
+    async def send_message_with_keyboard(
+        self,
+        chat_id: str | int,
+        text: str,
+        inline_keyboard: list[list[dict[str, str]]],
+    ) -> dict[str, Any]:
+        """Send a message with an inline keyboard.
+        
+        Args:
+            chat_id: The chat ID
+            text: The message text
+            inline_keyboard: List of button rows. Each button is a dict with 'text' and 'callback_data'.
+        """
+        MAX_LENGTH = 4000
+        if len(text) > MAX_LENGTH:
+            text = text[:MAX_LENGTH] + "\n\n... (truncated)"
+
+        response = await self.client.post(
+            f"{self.base_url}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "Markdown",
+                "reply_markup": {"inline_keyboard": inline_keyboard},
+            },
+        )
+        if response.status_code != 200:
+            # Try without markdown if it fails
+            response = await self.client.post(
+                f"{self.base_url}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "reply_markup": {"inline_keyboard": inline_keyboard},
+                },
+            )
+        response.raise_for_status()
+        return response.json()
+
+    async def answer_callback_query(
+        self,
+        callback_query_id: str,
+        text: str | None = None,
+        show_alert: bool = False,
+    ) -> bool:
+        """Answer a callback query (button click).
+        
+        Args:
+            callback_query_id: The callback query ID
+            text: Optional text to show to the user
+            show_alert: If True, show as alert instead of toast
+        """
+        params: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            params["text"] = text
+        if show_alert:
+            params["show_alert"] = show_alert
+
+        try:
+            response = await self.client.post(
+                f"{self.base_url}/answerCallbackQuery",
+                json=params,
+            )
+            return response.status_code == 200
+        except Exception as e:
+            logger.warning(f"Failed to answer callback query: {e}")
+            return False
+
+    async def edit_message_text(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        inline_keyboard: list[list[dict[str, str]]] | None = None,
+    ) -> dict[str, Any]:
+        """Edit a message's text and optionally its keyboard.
+        
+        Args:
+            chat_id: The chat ID
+            message_id: The message ID to edit
+            text: New message text
+            inline_keyboard: New keyboard (None to remove)
+        """
+        MAX_LENGTH = 4000
+        if len(text) > MAX_LENGTH:
+            text = text[:MAX_LENGTH] + "\n\n... (truncated)"
+
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "Markdown",
+        }
+        if inline_keyboard is not None:
+            params["reply_markup"] = {"inline_keyboard": inline_keyboard}
+
+        response = await self.client.post(
+            f"{self.base_url}/editMessageText",
+            json=params,
+        )
+        if response.status_code != 200:
+            # Try without markdown
+            params["parse_mode"] = None
+            response = await self.client.post(
+                f"{self.base_url}/editMessageText",
+                json=params,
+            )
+        response.raise_for_status()
+        return response.json()
+
 
 class TelegramOpenCodeBridge:
     """Bridge service that watches Telegram queue and sends to OpenCode."""
@@ -139,9 +249,9 @@ class TelegramOpenCodeBridge:
         bot_token: str | None = None,
         provider_id: str = "deepseek",
         model_id: str = "deepseek-reasoner",
+        favourite_models: list[tuple[str, str]] | None = None,
     ):
         self.opencode = OpenCodeClient(opencode_url)
-        self.command_handler = CommandHandler(self.opencode)
         self.poll_interval = poll_interval
         self.reply_to_telegram = reply_to_telegram
         self.running = False
@@ -151,6 +261,14 @@ class TelegramOpenCodeBridge:
         self.default_model_id = model_id
         # Track all sessions created: {session_id: (provider_id, model_id)}
         self.sessions: dict[str, tuple[str, str]] = {}
+        
+        # Create command handler with model callbacks and favourite models
+        self.command_handler = CommandHandler(
+            self.opencode,
+            set_model_callback=self._set_session_model,
+            get_model_callback=self._get_session_model,
+            favourite_models=favourite_models,
+        )
 
         # Telegram client for replies
         self.telegram: TelegramClient | None = None
@@ -212,6 +330,12 @@ class TelegramOpenCodeBridge:
                 self.pending_permissions = {int(k): v for k, v in pending_perms.items()}
                 # Load current chat_id
                 self.current_chat_id = data.get("current_chat_id")
+                # Load model cache and sync to command handler
+                model_cache = data.get("model_cache", {})
+                if model_cache:
+                    self.command_handler._model_cache = {
+                        k: tuple(v) for k, v in model_cache.items() if isinstance(v, list) and len(v) == 2
+                    }
                 if self.session_id:
                     logger.info(f"Loaded saved session: {self.session_id[:8]}... with model {self.session_model}")
                     self.command_handler.current_session_id = self.session_id
@@ -227,6 +351,8 @@ class TelegramOpenCodeBridge:
         # Convert pending questions/permissions keys to strings for JSON
         pending_q_serializable = {str(k): v for k, v in self.pending_questions.items()}
         pending_p_serializable = {str(k): v for k, v in self.pending_permissions.items()}
+        # Convert model cache tuples to lists for JSON
+        model_cache_serializable = {k: list(v) for k, v in self.command_handler._model_cache.items()}
         data = {
             "forwarded_ids": list(self.forwarded_ids),
             "session_id": self.session_id,
@@ -235,10 +361,25 @@ class TelegramOpenCodeBridge:
             "pending_questions": pending_q_serializable,
             "pending_permissions": pending_p_serializable,
             "current_chat_id": self.current_chat_id,
+            "model_cache": model_cache_serializable,
             "last_updated": datetime.now().isoformat(),
         }
         with open(self.bridge_state_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+
+    def _set_session_model(self, provider_id: str, model_id: str) -> None:
+        """Set the model for the current session (callback for CommandHandler)."""
+        self.session_model = (provider_id, model_id)
+        # Also update the sessions dict if we have a session_id
+        if self.session_id:
+            self.sessions[self.session_id] = (provider_id, model_id)
+        # Persist the change
+        self._save_state()
+        logger.info(f"Session model set to {provider_id}/{model_id}")
+
+    def _get_session_model(self) -> tuple[str, str] | None:
+        """Get the current session model (callback for CommandHandler)."""
+        return self.session_model
 
     def _read_queue(self) -> list[dict[str, Any]]:
         """Read messages from queue file."""
@@ -256,6 +397,73 @@ class TelegramOpenCodeBridge:
         remaining = [msg for msg in queue if msg.get("message_id") not in message_ids]
         with open(self.queue_file, "w", encoding="utf-8") as f:
             json.dump(remaining, f, indent=2, ensure_ascii=False)
+
+    def _clear_queue(self) -> int:
+        """Clear all messages from the queue.
+        
+        Returns:
+            Number of messages that were cleared.
+        """
+        queue = self._read_queue()
+        count = len(queue)
+        if count > 0:
+            with open(self.queue_file, "w", encoding="utf-8") as f:
+                json.dump([], f)
+            logger.info(f"Cleared {count} messages from queue")
+        return count
+
+    def _clear_old_messages_from_queue(self, max_age_seconds: int = 300) -> int:
+        """Remove messages older than max_age_seconds from the queue.
+        
+        Args:
+            max_age_seconds: Maximum age of messages to keep (default: 5 minutes)
+            
+        Returns:
+            Number of messages that were removed.
+        """
+        from datetime import datetime, timedelta
+        
+        queue = self._read_queue()
+        if not queue:
+            return 0
+        
+        cutoff_time = datetime.now() - timedelta(seconds=max_age_seconds)
+        original_count = len(queue)
+        
+        remaining = []
+        for msg in queue:
+            # Check received_at timestamp
+            received_at = msg.get("received_at")
+            if received_at:
+                try:
+                    msg_time = datetime.fromisoformat(received_at)
+                    if msg_time >= cutoff_time:
+                        remaining.append(msg)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            
+            # Fallback: check date field (Unix timestamp)
+            date = msg.get("date")
+            if date:
+                try:
+                    msg_time = datetime.fromtimestamp(date)
+                    if msg_time >= cutoff_time:
+                        remaining.append(msg)
+                        continue
+                except (ValueError, TypeError, OSError):
+                    pass
+            
+            # If we can't determine age, keep the message
+            remaining.append(msg)
+        
+        removed_count = original_count - len(remaining)
+        if removed_count > 0:
+            with open(self.queue_file, "w", encoding="utf-8") as f:
+                json.dump(remaining, f, indent=2, ensure_ascii=False)
+            logger.info(f"Removed {removed_count} old messages from queue (older than {max_age_seconds}s)")
+        
+        return removed_count
 
     async def process_queue(self) -> None:
         """Process any new messages in the queue."""
@@ -277,9 +485,20 @@ class TelegramOpenCodeBridge:
         processed_ids: set[int] = set()
         for msg in new_messages:
             msg_id: int | None = msg.get("message_id")
-            text = msg.get("text", "")
+            msg_type = msg.get("type", "message")
             username = msg.get("from_username", "Unknown")
             chat_id: int | None = msg.get("chat_id")
+            
+            # Handle callback queries (button clicks) first
+            if msg_type == "callback_query":
+                await self._handle_callback_query(msg)
+                if msg_id is not None:
+                    self.forwarded_ids.add(msg_id)
+                    processed_ids.add(msg_id)
+                    self._save_state()
+                continue
+            
+            text = msg.get("text", "")
 
             if msg_id is None:
                 logger.warning("Message has no message_id, skipping")
@@ -289,6 +508,7 @@ class TelegramOpenCodeBridge:
                 logger.debug(f"Skipping message {msg_id} (no text)")
                 self.forwarded_ids.add(msg_id)
                 processed_ids.add(msg_id)
+                self._save_state()
                 continue
 
             # Sync command handler's session_id with bridge's session_id
@@ -301,11 +521,21 @@ class TelegramOpenCodeBridge:
                 # It was a command, send the response back
                 logger.info(f"Handled command: {text[:50]}...")
                 if self.telegram and chat_id:
-                    await self.telegram.send_message(chat_id, response)
+                    # Check if response is a CommandResponse with keyboard
+                    if isinstance(response, CommandResponse):
+                        if response.keyboard:
+                            await self.telegram.send_message_with_keyboard(
+                                chat_id, response.text, response.keyboard
+                            )
+                        else:
+                            await self.telegram.send_message(chat_id, response.text)
+                    else:
+                        await self.telegram.send_message(chat_id, str(response))
                 # Update session_id in case it was changed by command
                 self.session_id = self.command_handler.current_session_id
                 self.forwarded_ids.add(msg_id)
                 processed_ids.add(msg_id)
+                self._save_state()
                 continue
 
             # Check if this is a response to a pending question
@@ -315,18 +545,13 @@ class TelegramOpenCodeBridge:
                     logger.info(f"Handled as question response: {text[:50]}...")
                     self.forwarded_ids.add(msg_id)
                     processed_ids.add(msg_id)
+                    self._save_state()
                     continue
 
-            # Check if this is a response to a pending permission
-            if chat_id and self.pending_permissions:
-                is_permission_response = await self._check_for_permission_response(text, chat_id)
-                if is_permission_response:
-                    logger.info(f"Handled as permission response: {text[:50]}...")
-                    self.forwarded_ids.add(msg_id)
-                    processed_ids.add(msg_id)
-                    continue
+            # Note: Permission responses are ONLY handled via inline keyboard callbacks,
+            # not via text messages. This ensures permissions are explicitly approved/rejected.
 
-            # Not a command, question response, or permission response - process as regular prompt
+            # Not a command, question response - process as regular prompt
             logger.info(f"Processing regular prompt: {text[:50]}...")
 
             # Use requested model or fall back to default
@@ -406,6 +631,11 @@ class TelegramOpenCodeBridge:
                 logger.error("No session available")
                 continue
 
+            # Use session_model if set, otherwise fall back to defaults
+            if self.session_model:
+                provider_id, model_id = self.session_model
+            # else provider_id and model_id are already set to defaults above
+
             # Format the prompt with context
             prompt = f"[Telegram from @{username}]: {text}"
 
@@ -427,9 +657,9 @@ class TelegramOpenCodeBridge:
                     )
                     logger.info(f"OpenCode response received for message {msg_id}")
 
-                    # Check for any pending questions or permissions after response
-                    await self._handle_pending_questions(session_id, chat_id)
-                    await self._handle_pending_permissions(session_id, chat_id)
+                    # Note: Pending questions/permissions are now ONLY handled during
+                    # the typing loop in _poll_and_forward_pending(). This prevents
+                    # duplicate messages being sent to Telegram.
 
                     # Always send response back to Telegram, even if empty
                     if not response_text:
@@ -453,6 +683,7 @@ class TelegramOpenCodeBridge:
 
                 self.forwarded_ids.add(msg_id)
                 processed_ids.add(msg_id)
+                self._save_state()
 
             except httpx.HTTPStatusError as e:
                 logger.error(f"HTTP error sending message {msg_id}: {e.response.status_code}")
@@ -482,6 +713,7 @@ class TelegramOpenCodeBridge:
                 # Mark as forwarded to avoid resending
                 self.forwarded_ids.add(msg_id)
                 processed_ids.add(msg_id)
+                self._save_state()
             except Exception as e:
                 logger.error(f"Error sending message {msg_id} to OpenCode: {e}")
 
@@ -593,6 +825,288 @@ class TelegramOpenCodeBridge:
                 send_task.cancel()
             raise
 
+    async def _handle_callback_query(self, msg: dict[str, Any]) -> None:
+        """Handle a callback query (inline button click).
+        
+        Args:
+            msg: The callback query message from the queue
+        """
+        callback_data = msg.get("callback_data", "")
+        callback_query_id = msg.get("callback_query_id", "")
+        chat_id = msg.get("chat_id")
+        original_message_id = msg.get("original_message_id")
+        username = msg.get("from_username", "Unknown")
+        
+        logger.info(f"Handling callback query from @{username}: {callback_data} (original_msg_id={original_message_id})")
+        logger.debug(f"Current pending_permissions count: {len(self.pending_permissions)}")
+        
+        if not callback_data or callback_data == "ignore":
+            # Ignore separator buttons or empty callbacks
+            if self.telegram and callback_query_id:
+                await self.telegram.answer_callback_query(callback_query_id)
+            return
+        
+        # Handle model selection: setmodel:provider_id:model_id or sm:hash
+        model_info = self.command_handler.lookup_model_callback(callback_data)
+        if model_info:
+            provider_id, model_id = model_info
+            
+            # Set the model via our callback
+            self._set_session_model(provider_id, model_id)
+            
+            # Answer the callback query (removes loading spinner on button)
+            if self.telegram and callback_query_id:
+                await self.telegram.answer_callback_query(
+                    callback_query_id,
+                    f"Model set to {provider_id}/{model_id}"
+                )
+            
+            # Edit the original message to show confirmation
+            if self.telegram and chat_id and original_message_id:
+                try:
+                    new_text = f"✅ *Model set to:*\n\n`{provider_id}/{model_id}`\n\nAll subsequent prompts will use this model."
+                    await self.telegram.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=original_message_id,
+                        text=new_text,
+                        inline_keyboard=None,  # Remove the keyboard
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to edit message after model selection: {e}")
+                    # Fallback: send a new message
+                    await self.telegram.send_message(
+                        chat_id,
+                        f"✅ Model set to `{provider_id}/{model_id}`"
+                    )
+            
+            logger.info(f"Model set to {provider_id}/{model_id} via callback")
+            return
+        
+        # Handle session selection: session:session_id
+        if callback_data.startswith("session:"):
+            session_id = callback_data[8:]  # Remove "session:" prefix
+            
+            # Switch to the selected session
+            self.session_id = session_id
+            self.command_handler.current_session_id = session_id
+            
+            # Get session info for confirmation
+            try:
+                session_info = await self.opencode.get_session(session_id)
+                title = session_info.get("title", "Untitled")
+            except Exception:
+                title = "Unknown"
+            
+            short_id = session_id[:8]
+            
+            # Answer the callback query
+            if self.telegram and callback_query_id:
+                await self.telegram.answer_callback_query(
+                    callback_query_id,
+                    f"Switched to session {short_id}"
+                )
+            
+            # Edit the original message to show confirmation
+            if self.telegram and chat_id and original_message_id:
+                try:
+                    new_text = f"✅ *Switched to session:*\n\n`{short_id}`\n_{title}_"
+                    await self.telegram.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=original_message_id,
+                        text=new_text,
+                        inline_keyboard=None,  # Remove the keyboard
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to edit message after session selection: {e}")
+                    await self.telegram.send_message(
+                        chat_id,
+                        f"✅ Switched to session `{short_id}`"
+                    )
+            
+            self._save_state()
+            logger.info(f"Session switched to {short_id} via callback")
+            return
+        
+        # Handle permission response: perm:y|a|n:request_id
+        if callback_data.startswith("perm:"):
+            parts = callback_data.split(":", 2)
+            logger.debug(f"Permission callback parts: {parts}")
+            if len(parts) >= 3:
+                action = parts[1]  # y, a, or n
+                request_id_prefix = parts[2]
+                
+                logger.info(f"Permission callback: action={action}, request_id_prefix='{request_id_prefix}'")
+                logger.info(f"Pending permissions ({len(self.pending_permissions)}): {list(self.pending_permissions.keys())}")
+                for msg_id, ctx in self.pending_permissions.items():
+                    logger.info(f"  msg_id={msg_id}, request_id='{ctx.get('request_id', '')}'")
+                
+                # Find the matching pending permission
+                matching_msg_id = None
+                matching_context = None
+                for msg_id, p_context in self.pending_permissions.items():
+                    stored_request_id = p_context.get("request_id", "")
+                    if stored_request_id.startswith(request_id_prefix):
+                        matching_msg_id = msg_id
+                        matching_context = p_context
+                        logger.info(f"Found match: msg_id={msg_id}")
+                        break
+                
+                if matching_context and matching_msg_id is not None:
+                    # Map action to reply (OpenCode expects "once", "always", or "reject")
+                    action_map = {"y": "once", "a": "always", "n": "reject"}
+                    reply = action_map.get(action, "reject")
+                    action_text = {"y": "Allowed", "a": "Always allowed", "n": "Rejected"}.get(action, "Rejected")
+                    
+                    full_request_id = matching_context.get("request_id", "")
+                    logger.info(f"Sending permission response: request_id={full_request_id}, reply={reply}")
+                    
+                    # Send permission response to OpenCode
+                    success = await self.opencode.reply_to_permission(
+                        request_id=full_request_id,
+                        reply=reply,
+                    )
+                    
+                    if success:
+                        # Remove from pending permissions
+                        del self.pending_permissions[matching_msg_id]
+                        self._save_state()
+                        
+                        # Answer the callback query
+                        if self.telegram and callback_query_id:
+                            await self.telegram.answer_callback_query(
+                                callback_query_id,
+                                f"Permission {action_text.lower()}"
+                            )
+                        
+                        # Edit the original message to show result
+                        if self.telegram and chat_id and original_message_id:
+                            try:
+                                permission = matching_context.get("permission", "unknown")
+                                new_text = f"✅ *Permission {action_text}*\n\nTool: `{permission}`"
+                                await self.telegram.edit_message_text(
+                                    chat_id=chat_id,
+                                    message_id=original_message_id,
+                                    text=new_text,
+                                    inline_keyboard=None,  # Remove the keyboard
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to edit message after permission response: {e}")
+                        
+                        logger.info(f"Permission response sent: {reply}")
+                        return
+                    else:
+                        logger.error("Failed to send permission response to OpenCode")
+                        if self.telegram and callback_query_id:
+                            await self.telegram.answer_callback_query(
+                                callback_query_id,
+                                "Failed to send response",
+                                show_alert=True
+                            )
+                        return
+                else:
+                    logger.warning(f"No matching pending permission for: {request_id_prefix}")
+                    if self.telegram and callback_query_id:
+                        await self.telegram.answer_callback_query(
+                            callback_query_id,
+                            "Permission request expired",
+                            show_alert=True
+                        )
+                    return
+        
+        # Handle question response: q:<request_id_prefix>:<option_index>
+        if callback_data.startswith("q:"):
+            parts = callback_data.split(":", 2)
+            if len(parts) >= 3:
+                request_id_prefix = parts[1]
+                try:
+                    option_index = int(parts[2])
+                except ValueError:
+                    option_index = 0
+                
+                # Find the matching pending question
+                matching_msg_id = None
+                matching_context = None
+                for msg_id, q_context in self.pending_questions.items():
+                    if q_context.get("request_id", "").startswith(request_id_prefix):
+                        matching_msg_id = msg_id
+                        matching_context = q_context
+                        break
+                
+                if matching_context and matching_msg_id is not None:
+                    options = matching_context.get("options", [])
+                    if 0 <= option_index < len(options):
+                        selected_label = options[option_index].get("label", f"Option {option_index + 1}")
+                        
+                        # Send question response to OpenCode
+                        success = await self.opencode.respond_to_question(
+                            request_id=matching_context.get("request_id", ""),
+                            answers=[[selected_label]],  # Wrap in list for the answers array
+                        )
+                        
+                        if success:
+                            # Remove from pending questions
+                            del self.pending_questions[matching_msg_id]
+                            self._save_state()
+                            
+                            # Answer the callback query
+                            if self.telegram and callback_query_id:
+                                await self.telegram.answer_callback_query(
+                                    callback_query_id,
+                                    f"Selected: {selected_label[:30]}"
+                                )
+                            
+                            # Edit the original message to show result
+                            if self.telegram and chat_id and original_message_id:
+                                try:
+                                    new_text = f"✅ *Response recorded*\n\nSelected: _{selected_label}_"
+                                    await self.telegram.edit_message_text(
+                                        chat_id=chat_id,
+                                        message_id=original_message_id,
+                                        text=new_text,
+                                        inline_keyboard=None,  # Remove the keyboard
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"Failed to edit message after question response: {e}")
+                            
+                            logger.info(f"Question response sent: {selected_label}")
+                            return
+                        else:
+                            logger.error("Failed to send question response to OpenCode")
+                            if self.telegram and callback_query_id:
+                                await self.telegram.answer_callback_query(
+                                    callback_query_id,
+                                    "Failed to send response",
+                                    show_alert=True
+                                )
+                            return
+                    else:
+                        logger.warning(f"Invalid option index {option_index} for question")
+                        if self.telegram and callback_query_id:
+                            await self.telegram.answer_callback_query(
+                                callback_query_id,
+                                "Invalid option",
+                                show_alert=True
+                            )
+                        return
+                else:
+                    logger.warning(f"No matching pending question for: {request_id_prefix}")
+                    if self.telegram and callback_query_id:
+                        await self.telegram.answer_callback_query(
+                            callback_query_id,
+                            "Question expired",
+                            show_alert=True
+                        )
+                    return
+        
+        # Unknown callback data
+        logger.warning(f"Unknown callback data: {callback_data}")
+        if self.telegram and callback_query_id:
+            await self.telegram.answer_callback_query(
+                callback_query_id,
+                "Unknown action",
+                show_alert=False
+            )
+
     async def _poll_and_forward_pending(self, session_id: str, chat_id: int) -> None:
         """Poll for pending questions/permissions and forward them to Telegram.
         
@@ -615,8 +1129,11 @@ class TelegramOpenCodeBridge:
                 if already_forwarded:
                     continue
                     
-                formatted = await self._format_question_for_telegram(qr)
-                result = await self.telegram.send_message(chat_id, formatted)
+                formatted_text, keyboard = await self._format_question_for_telegram(qr)
+                if keyboard:
+                    result = await self.telegram.send_message_with_keyboard(chat_id, formatted_text, keyboard)
+                else:
+                    result = await self.telegram.send_message(chat_id, formatted_text)
                 
                 if result.get("ok"):
                     sent_msg = result.get("result", {})
@@ -648,8 +1165,8 @@ class TelegramOpenCodeBridge:
                 if already_forwarded:
                     continue
                     
-                formatted = await self._format_permission_for_telegram(pr)
-                result = await self.telegram.send_message(chat_id, formatted)
+                formatted_text, keyboard = await self._format_permission_for_telegram(pr)
+                result = await self.telegram.send_message_with_keyboard(chat_id, formatted_text, keyboard)
                 
                 if result.get("ok"):
                     sent_msg = result.get("result", {})
@@ -717,69 +1234,60 @@ class TelegramOpenCodeBridge:
                     self._remove_from_queue({msg_id})
                     continue
             
-            # Try to handle as permission response
-            if self.pending_permissions:
-                is_permission_response = await self._check_for_permission_response(text, chat_id)
-                if is_permission_response:
-                    logger.info(f"Handled permission response during wait: {text[:50]}...")
-                    self.forwarded_ids.add(msg_id)
-                    self._save_state()
-                    # Remove from queue
-                    self._remove_from_queue({msg_id})
-                    continue
+            # Note: Permission responses are only handled via inline keyboard callbacks
 
-    async def _format_question_for_telegram(self, question_request: dict[str, Any]) -> str:
+    async def _format_question_for_telegram(self, question_request: dict[str, Any]) -> tuple[str, list[list[dict[str, str]]]]:
         """Format an OpenCode QuestionRequest for Telegram display.
+        
+        When options are provided, ONLY the inline keyboard is used for responses.
+        Text-based responses are NOT supported when options are present - this ensures
+        a clean UX where users must click a button to respond.
         
         Args:
             question_request: QuestionRequest with id, sessionID, questions array
             
         Returns:
-            Formatted question string for Telegram
+            Tuple of (formatted text, inline keyboard)
         """
+        request_id = question_request.get("id", "")
         questions = question_request.get("questions", [])
         if not questions:
-            return "*No questions in request*"
+            return "*No questions in request*", []
         
         all_lines = []
+        keyboard: list[list[dict[str, str]]] = []
         
-        for i, q in enumerate(questions):
-            header = q.get("header", "Question")
-            question_text = q.get("question", "Please respond:")
-            options = q.get("options", [])
-            multiple = q.get("multiple", False)
-            custom = q.get("custom", True)
-            
-            if len(questions) > 1:
-                all_lines.append(f"*{i+1}. {header}*")
-            else:
-                all_lines.append(f"*{header}*")
-            all_lines.append("")
-            all_lines.append(question_text)
-            all_lines.append("")
-            
-            if options:
-                all_lines.append("Options:")
-                for j, opt in enumerate(options, 1):
-                    label = opt.get("label", f"Option {j}")
-                    desc = opt.get("description", "")
-                    if desc:
-                        all_lines.append(f"  {j}. {label} - {desc}")
-                    else:
-                        all_lines.append(f"  {j}. {label}")
-            
-            if multiple:
-                all_lines.append("\n(You can select multiple options)")
-            
-            if custom:
-                all_lines.append("\nReply with option number(s) or type your answer:")
-            elif options:
-                all_lines.append("\nReply with option number(s):")
-            
-            if i < len(questions) - 1:
-                all_lines.append("\n---\n")
+        # For now, handle the first question (most common case)
+        q = questions[0]
+        header = q.get("header", "Question")
+        question_text = q.get("question", "Please respond:")
+        options = q.get("options", [])
         
-        return "\n".join(all_lines)
+        all_lines.append(f"*❓ {header}*")
+        all_lines.append("")
+        all_lines.append(question_text)
+        
+        if options:
+            all_lines.append("")
+            # Create keyboard buttons for each option
+            for j, opt in enumerate(options):
+                label = opt.get("label", f"Option {j+1}")
+                desc = opt.get("description", "")
+                
+                # Show description in text
+                if desc:
+                    all_lines.append(f"  {j+1}. {label} - _{desc}_")
+                
+                # Add button for this option
+                # Use short callback data: q:<request_id_prefix>:<option_index>
+                callback_data = f"q:{request_id[:45]}:{j}"
+                keyboard.append([{"text": f"{j+1}. {label}", "callback_data": callback_data}])
+            
+            # Note: No text hint - users MUST use the keyboard buttons
+            all_lines.append("")
+            all_lines.append("_Tap a button above to respond._")
+        
+        return "\n".join(all_lines), keyboard
 
     async def _handle_pending_questions(self, session_id: str, chat_id: int) -> bool:
         """Check for and handle pending questions from OpenCode.
@@ -800,8 +1308,20 @@ class TelegramOpenCodeBridge:
             return False
         
         for qr in question_requests:
-            formatted = await self._format_question_for_telegram(qr)
-            result = await self.telegram.send_message(chat_id, formatted)
+            request_id = qr.get("id")
+            # Check if we've already forwarded this question
+            already_forwarded = any(
+                pq.get("request_id") == request_id 
+                for pq in self.pending_questions.values()
+            )
+            if already_forwarded:
+                continue
+                
+            formatted_text, keyboard = await self._format_question_for_telegram(qr)
+            if keyboard:
+                result = await self.telegram.send_message_with_keyboard(chat_id, formatted_text, keyboard)
+            else:
+                result = await self.telegram.send_message(chat_id, formatted_text)
             
             # Get the sent message ID to track the question
             if result.get("ok"):
@@ -833,6 +1353,11 @@ class TelegramOpenCodeBridge:
     async def _check_for_question_response(self, text: str, chat_id: int) -> bool:
         """Check if an incoming message is a response to a pending question.
         
+        NOTE: When a question has options (inline keyboard buttons), text responses
+        are NOT accepted. Users MUST click a button. This ensures a clean UX.
+        
+        Text responses are only accepted for questions WITHOUT predefined options.
+        
         Args:
             text: The incoming message text
             chat_id: The Telegram chat ID
@@ -849,40 +1374,15 @@ class TelegramOpenCodeBridge:
         
         # Parse the user's response
         options = q_context.get("options", [])
-        custom_allowed = q_context.get("custom", True)
         
-        answer: list[str] = []
-        
-        # Try to parse as option number(s)
-        text_stripped = text.strip()
-        
-        # Check if user typed a number or comma-separated numbers
-        parts = [p.strip() for p in text_stripped.replace(",", " ").split()]
-        all_numbers = True
-        selected_indices = []
-        
-        for part in parts:
-            try:
-                idx = int(part)
-                if 1 <= idx <= len(options):
-                    selected_indices.append(idx - 1)  # Convert to 0-based
-                else:
-                    all_numbers = False
-                    break
-            except ValueError:
-                all_numbers = False
-                break
-        
-        if all_numbers and selected_indices:
-            # User selected option(s) by number
-            for idx in selected_indices:
-                answer.append(options[idx].get("label", f"Option {idx + 1}"))
-        elif custom_allowed:
-            # User typed a custom response
-            answer = [text_stripped]
-        else:
-            # Not a valid response, don't consume as answer
+        # If options exist, text responses are NOT accepted - must use keyboard
+        if options:
+            # Don't consume this message as a question response
+            # User must click a button
             return False
+        
+        # No options - accept text response directly
+        answer: list[str] = [text.strip()]
         
         # Send the response to OpenCode using the Question API
         request_id = q_context.get("request_id")
@@ -890,7 +1390,6 @@ class TelegramOpenCodeBridge:
         if request_id:
             # The Question API expects answers as list of list of strings
             # One answer array per question in the request
-            # For now we assume single-question requests
             success = await self.opencode.respond_to_question(
                 request_id=request_id,
                 answers=[answer],  # Wrap in list for the answers array
@@ -920,15 +1419,16 @@ class TelegramOpenCodeBridge:
         
         return False
 
-    async def _format_permission_for_telegram(self, permission_request: dict[str, Any]) -> str:
+    async def _format_permission_for_telegram(self, permission_request: dict[str, Any]) -> tuple[str, list[list[dict[str, str]]]]:
         """Format an OpenCode PermissionRequest for Telegram display.
         
         Args:
             permission_request: PermissionRequest with id, sessionID, permission, patterns, metadata
             
         Returns:
-            Formatted permission request string for Telegram
+            Tuple of (formatted text, inline keyboard)
         """
+        request_id = permission_request.get("id", "")
         permission = permission_request.get("permission", "unknown")
         patterns = permission_request.get("patterns", [])
         metadata = permission_request.get("metadata", {})
@@ -956,13 +1456,18 @@ class TelegramOpenCodeBridge:
             if "path" in metadata:
                 lines.append(f"Path: `{metadata['path']}`")
         
-        lines.append("\n*Reply with:*")
-        lines.append("  `y` or `yes` - Allow once")
-        lines.append("  `a` or `always` - Always allow")
-        lines.append("  `n` or `no` - Reject")
-        lines.append("  Any other text - Reject with feedback")
+        # Create inline keyboard for permission responses
+        keyboard = [
+            [
+                {"text": "✅ Allow", "callback_data": f"perm:y:{request_id[:50]}"},
+                {"text": "✅ Always", "callback_data": f"perm:a:{request_id[:50]}"},
+            ],
+            [
+                {"text": "❌ Reject", "callback_data": f"perm:n:{request_id[:50]}"},
+            ],
+        ]
         
-        return "\n".join(lines)
+        return "\n".join(lines), keyboard
 
     async def _handle_pending_permissions(self, session_id: str, chat_id: int) -> bool:
         """Check for and handle pending permissions from OpenCode.
@@ -983,8 +1488,21 @@ class TelegramOpenCodeBridge:
             return False
         
         for pr in permission_requests:
-            formatted = await self._format_permission_for_telegram(pr)
-            result = await self.telegram.send_message(chat_id, formatted)
+            request_id = pr.get("id")
+            logger.info(f"Processing permission request: id={request_id}, permission={pr.get('permission')}")
+            
+            # Check if we've already forwarded this permission
+            already_forwarded = any(
+                pp.get("request_id") == request_id 
+                for pp in self.pending_permissions.values()
+            )
+            if already_forwarded:
+                logger.debug(f"Permission {request_id} already forwarded, skipping")
+                continue
+                
+            formatted_text, keyboard = await self._format_permission_for_telegram(pr)
+            logger.debug(f"Sending permission message with keyboard: {keyboard}")
+            result = await self.telegram.send_message_with_keyboard(chat_id, formatted_text, keyboard)
             
             # Get the sent message ID to track the permission
             if result.get("ok"):
@@ -998,84 +1516,58 @@ class TelegramOpenCodeBridge:
                         "patterns": pr.get("patterns", []),
                     }
                     self._save_state()
-                    request_id = pr.get("id", "unknown")
-                    logger.info(f"Forwarded permission to Telegram (msg_id={sent_msg_id}): {request_id}")
+                    logger.info(f"Stored pending permission: msg_id={sent_msg_id}, request_id={request_id}")
+                    logger.debug(f"pending_permissions now has {len(self.pending_permissions)} entries")
             else:
                 logger.warning(f"Failed to send permission to Telegram: {result}")
         
         return True
 
-    async def _check_for_permission_response(self, text: str, chat_id: int) -> bool:
-        """Check if an incoming message is a response to a pending permission.
+    async def _cleanup_stale_pending(self) -> None:
+        """Clean up stale pending questions/permissions that no longer exist in OpenCode.
         
-        Args:
-            text: The incoming message text
-            chat_id: The Telegram chat ID
-            
-        Returns:
-            True if the message was handled as a permission response, False otherwise
+        This is called on startup to handle cases where the bridge has persisted pending
+        state but OpenCode was restarted and no longer has those pending requests.
         """
-        if not self.pending_permissions:
-            return False
+        if not self.pending_questions and not self.pending_permissions:
+            return
         
-        # Get the oldest pending permission (FIFO)
-        oldest_p_msg_id = min(self.pending_permissions.keys())
-        p_context = self.pending_permissions[oldest_p_msg_id]
-        
-        text_lower = text.strip().lower()
-        
-        # Parse the response
-        reply: str | None = None
-        message: str | None = None
-        
-        if text_lower in ("y", "yes", "1", "ok", "allow"):
-            reply = "once"
-        elif text_lower in ("a", "always", "remember"):
-            reply = "always"
-        elif text_lower in ("n", "no", "0", "deny", "reject"):
-            reply = "reject"
-        else:
-            # Treat as rejection with feedback message
-            reply = "reject"
-            message = text.strip()
-        
-        # Send the response to OpenCode
-        request_id = p_context.get("request_id")
-        
-        if request_id:
-            success = await self.opencode.reply_to_permission(
-                request_id=request_id,
-                reply=reply,
-                message=message,
-            )
+        try:
+            # Get current pending questions from OpenCode
+            current_questions = await self.opencode.list_pending_questions()
+            current_q_ids = {q.get("id") for q in current_questions}
             
-            if success:
-                logger.info(f"Sent permission response to OpenCode: {reply}" + (f" with message: {message}" if message else ""))
-                # Remove from pending permissions
-                del self.pending_permissions[oldest_p_msg_id]
+            # Find and remove stale pending questions
+            stale_q_msg_ids = []
+            for msg_id, q_context in self.pending_questions.items():
+                if q_context.get("request_id") not in current_q_ids:
+                    stale_q_msg_ids.append(msg_id)
+            
+            for msg_id in stale_q_msg_ids:
+                logger.info(f"Cleaning up stale pending question: {self.pending_questions[msg_id].get('request_id')}")
+                del self.pending_questions[msg_id]
+            
+            # Get current pending permissions from OpenCode
+            current_permissions = await self.opencode.list_pending_permissions()
+            current_p_ids = {p.get("id") for p in current_permissions}
+            
+            # Find and remove stale pending permissions
+            stale_p_msg_ids = []
+            for msg_id, p_context in self.pending_permissions.items():
+                if p_context.get("request_id") not in current_p_ids:
+                    stale_p_msg_ids.append(msg_id)
+            
+            for msg_id in stale_p_msg_ids:
+                logger.info(f"Cleaning up stale pending permission: {self.pending_permissions[msg_id].get('request_id')}")
+                del self.pending_permissions[msg_id]
+            
+            # Save state if anything was cleaned up
+            if stale_q_msg_ids or stale_p_msg_ids:
                 self._save_state()
+                logger.info(f"Cleaned up {len(stale_q_msg_ids)} stale questions and {len(stale_p_msg_ids)} stale permissions")
                 
-                # Send confirmation to Telegram
-                if self.telegram:
-                    if reply == "once":
-                        await self.telegram.send_message(chat_id, "✓ Permission granted (once)")
-                    elif reply == "always":
-                        await self.telegram.send_message(chat_id, "✓ Permission granted (always)")
-                    elif message:
-                        await self.telegram.send_message(chat_id, f"✓ Permission rejected with feedback")
-                    else:
-                        await self.telegram.send_message(chat_id, "✓ Permission rejected")
-                return True
-            else:
-                logger.error("Failed to send permission response to OpenCode")
-                if self.telegram:
-                    await self.telegram.send_message(
-                        chat_id,
-                        "❌ Failed to send response to OpenCode. Please try again."
-                    )
-                return False
-        
-        return False
+        except Exception as e:
+            logger.warning(f"Failed to cleanup stale pending requests: {e}")
 
     async def run(self) -> None:
         """Run the bridge service continuously."""
@@ -1096,6 +1588,16 @@ class TelegramOpenCodeBridge:
         logger.info(f"Reply to Telegram: {self.reply_to_telegram}")
         logger.info(f"Default Provider: {self.default_provider_id}, Default Model: {self.default_model_id}")
 
+        # Clear the message queue on startup (fresh start for new OpenCode session)
+        self._clear_queue()
+        
+        # Also clear forwarded_ids since we're starting fresh
+        old_forwarded_count = len(self.forwarded_ids)
+        self.forwarded_ids.clear()
+        if old_forwarded_count > 0:
+            logger.info(f"Cleared {old_forwarded_count} forwarded message IDs")
+        self._save_state()
+
         # Check OpenCode connection
         if not await self.opencode.is_server_running():
             logger.error(f"Cannot connect to OpenCode at {self.opencode.base_url}")
@@ -1103,6 +1605,9 @@ class TelegramOpenCodeBridge:
             return
 
         logger.info("Connected to OpenCode server")
+
+        # Clean up stale pending questions/permissions from previous run
+        await self._cleanup_stale_pending()
 
         # Ensure bot commands are set if Telegram client is available
         if self.telegram:
@@ -1113,9 +1618,20 @@ class TelegramOpenCodeBridge:
             except Exception as e:
                 logger.warning(f"Failed to set bot commands: {e}")
 
+        # Track iterations for periodic cleanup
+        cleanup_interval = 60  # Clean old messages every 60 iterations (60 * poll_interval seconds)
+        iteration_count = 0
+        
         try:
             while self.running:
                 await self.process_queue()
+                
+                # Periodically clean old messages from queue
+                iteration_count += 1
+                if iteration_count >= cleanup_interval:
+                    self._clear_old_messages_from_queue(max_age_seconds=300)  # 5 minutes
+                    iteration_count = 0
+                
                 await asyncio.sleep(self.poll_interval)
         except asyncio.CancelledError:
             logger.info("Bridge cancelled")
@@ -1129,6 +1645,17 @@ class TelegramOpenCodeBridge:
 
 async def async_main(args: argparse.Namespace) -> None:
     """Async entry point."""
+    # Parse favourite models from environment
+    favourite_models_str = os.environ.get("TELEGRAM_FAVOURITE_MODELS", "")
+    favourite_models: list[tuple[str, str]] | None = None
+    if favourite_models_str:
+        favourite_models = []
+        for item in favourite_models_str.split(","):
+            item = item.strip()
+            if "/" in item:
+                parts = item.split("/", 1)
+                favourite_models.append((parts[0].strip(), parts[1].strip()))
+    
     bridge = TelegramOpenCodeBridge(
         opencode_url=args.opencode_url,
         queue_dir=args.queue_dir,
@@ -1137,6 +1664,7 @@ async def async_main(args: argparse.Namespace) -> None:
         bot_token=args.bot_token,
         provider_id=args.provider,
         model_id=args.model,
+        favourite_models=favourite_models,
     )
     await bridge.run()
 

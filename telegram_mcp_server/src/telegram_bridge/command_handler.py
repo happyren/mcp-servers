@@ -4,7 +4,8 @@ import asyncio
 import os
 import logging
 import re
-from typing import Any, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional, Tuple, Union
 
 import httpx
 
@@ -13,13 +14,77 @@ from .opencode_client import OpenCodeClient
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class CommandResponse:
+    """Response from a command that can include text and/or keyboard."""
+    text: str
+    keyboard: list[list[dict[str, str]]] | None = None
+    
+    def __str__(self) -> str:
+        return self.text
+
+
 class CommandHandler:
     """Handle Telegram slash commands and forward to OpenCode API."""
 
-    def __init__(self, opencode: OpenCodeClient, current_session_id: Optional[str] = None):
+    # Default favourite models if none configured
+    DEFAULT_FAVOURITE_MODELS = [
+        ("deepseek", "deepseek-reasoner"),
+        ("deepseek", "deepseek-chat"),
+    ]
+
+    def __init__(
+        self,
+        opencode: OpenCodeClient,
+        current_session_id: Optional[str] = None,
+        set_model_callback: Optional[Callable[[str, str], None]] = None,
+        get_model_callback: Optional[Callable[[], Optional[Tuple[str, str]]]] = None,
+        favourite_models: Optional[list[Tuple[str, str]]] = None,
+    ):
         self.opencode = opencode
         self.current_session_id = current_session_id
         self._command_cache = {}
+        # Callbacks for model management (set by BridgeService)
+        self._set_model_callback = set_model_callback
+        self._get_model_callback = get_model_callback
+        # Cache for model lookup by short ID (to handle Telegram's 64-byte callback_data limit)
+        self._model_cache: dict[str, tuple[str, str]] = {}
+        # Favourite models list: [(provider_id, model_id), ...]
+        self._favourite_models = favourite_models if favourite_models is not None else self.DEFAULT_FAVOURITE_MODELS
+
+    def _make_model_callback(self, provider_id: str, model_id: str) -> str:
+        """Create a callback_data string for a model, ensuring it fits within 64 bytes.
+        
+        Telegram limits callback_data to 1-64 bytes. For long model names, we use
+        a hash-based short ID and store the mapping in _model_cache.
+        """
+        full_data = f"setmodel:{provider_id}:{model_id}"
+        if len(full_data.encode('utf-8')) <= 64:
+            return full_data
+        
+        # Generate a short hash-based ID
+        import hashlib
+        hash_input = f"{provider_id}:{model_id}"
+        short_hash = hashlib.md5(hash_input.encode()).hexdigest()[:8]
+        short_data = f"sm:{short_hash}"
+        
+        # Store in cache for lookup
+        self._model_cache[short_hash] = (provider_id, model_id)
+        return short_data
+
+    def lookup_model_callback(self, callback_data: str) -> Optional[Tuple[str, str]]:
+        """Look up a model from callback_data.
+        
+        Returns (provider_id, model_id) or None if not found.
+        """
+        if callback_data.startswith("setmodel:"):
+            parts = callback_data.split(":", 2)
+            if len(parts) == 3:
+                return (parts[1], parts[2])
+        elif callback_data.startswith("sm:"):
+            short_hash = callback_data[3:]
+            return self._model_cache.get(short_hash)
+        return None
 
     def get_command_help(self) -> str:
         """Get help text for all available commands."""
@@ -503,14 +568,16 @@ class CommandHandler:
             lines.append(f"\n... and {len(symbols) - 20} more symbols")
         return "\n".join(lines)
 
-    async def cmd_sessions(self, args: str) -> str:
+    async def cmd_sessions(self, args: str) -> Union[str, CommandResponse]:
         sessions = await self.opencode.list_sessions()
         if not sessions:
-            return "No sessions found."
+            return "No sessions found. Use `/session` to create one."
 
         status_dict = await self.opencode.get_session_status()
 
-        lines = ["📝 *Sessions*"]
+        lines = ["📝 *Sessions*\n"]
+        keyboard: list[list[dict[str, str]]] = []
+        
         for i, s in enumerate(sessions[:15], 1):  # Limit to 15 sessions
             session_id = s.get("id", "unknown")
             title = s.get("title", "Untitled")
@@ -518,37 +585,54 @@ class CommandHandler:
             status = status_dict.get(s.get("id", ""), {}).get("type", "unknown")
             is_current = s.get("id") == self.current_session_id
 
-            prefix = "👉" if is_current else f"{i}."
-            parent_note = " [subagent]" if parent_id else ""
             status_emoji = {"busy": "🔴", "idle": "🟢", "unknown": "⚪"}.get(status, "⚪")
-
-            lines.append(f"{prefix} `{session_id}`{parent_note} {status_emoji}\n   {title}")
+            current_marker = " 👈" if is_current else ""
+            parent_note = " [sub]" if parent_id else ""
+            
+            # Truncate title for button display
+            short_title = title[:25] + "..." if len(title) > 28 else title
+            short_id = session_id[:8]
+            
+            # Add button for each session
+            keyboard.append([{
+                "text": f"{status_emoji} {short_id}{parent_note} - {short_title}{current_marker}",
+                "callback_data": f"session:{session_id}"
+            }])
+        
         if len(sessions) > 15:
-            lines.append(f"\n... and {len(sessions) - 15} more sessions")
+            lines.append(f"_... and {len(sessions) - 15} more sessions_\n")
 
-        lines.append(f"\n*Current:* `{self.current_session_id if self.current_session_id else 'None'}`")
-        lines.append("Use `/use <id>` to switch sessions")
-        return "\n".join(lines)
+        lines.append(f"*Current:* `{self.current_session_id[:8] if self.current_session_id else 'None'}`")
+        lines.append("\nTap a session to switch to it.")
+        
+        return CommandResponse(text="\n".join(lines), keyboard=keyboard)
 
     async def cmd_session(self, args: str) -> str:
         # Parse optional model
         model = None
         provider = None
         if args:
-            # Check if args contains a model specification
+            # Check if args contains a model specification (provider/model)
             if "/" in args:
                 parts = args.split("/", 1)
-                provider = parts[0]
-                model = parts[1]
+                provider = parts[0].strip()
+                model = parts[1].strip()
             else:
-                model = args
+                model = args.strip()
 
         try:
             session = await self.opencode.create_session(title=model or "New Session")
             self.current_session_id = session["id"]
             short_id = session["id"][:8]
-            model_info = f" using model {provider}/{model}" if model else ""
-            return f"✅ Created new session `{short_id}`{model_info}\n\nUse `/use <id>` to switch sessions later."
+            
+            # If model specified with provider, set it via callback
+            if provider and model and self._set_model_callback:
+                self._set_model_callback(provider, model)
+                return f"✅ Created new session `{short_id}` using model `{provider}/{model}`\n\nUse `/use <id>` to switch sessions later."
+            elif model and not provider:
+                return f"✅ Created new session `{short_id}`\n\n⚠️ Model `{model}` specified without provider.\nUse `/set-model <provider>/{model}` to set the model."
+            else:
+                return f"✅ Created new session `{short_id}`\n\nUse `/use <id>` to switch sessions later."
         except Exception as e:
             return f"❌ Failed to create session: {str(e)}"
 
@@ -854,30 +938,37 @@ class CommandHandler:
             return f"❌ Error getting config: {str(e)}"
 
     async def cmd_models(self, args: str) -> str:
-        try:
-            providers = await self.opencode.get_providers()
-            lines = ["🤖 *Available Models*"]
-
-            for provider in providers.get("providers", []):
-                provider_id = provider.get("id", "unknown")
-                provider_name = provider.get("name", "Unknown")
-                models = provider.get("models", {})
-                if models:
-                    lines.append(f"\n**{provider_name}** (`{provider_id}`)")
-                    # models might be dict, convert to list of values
-                    if isinstance(models, dict):
-                        model_list = list(models.values())
-                    else:
-                        model_list = models
-                    for model in model_list[:5]:  # Limit to 5 models per provider
-                        model_id = model.get("id", "unknown")
-                        lines.append(f"  - `{model_id}`")
-                    if len(model_list) > 5:
-                        lines.append(f"  ... and {len(model_list) - 5} more models")
-
-            return "\n".join(lines)
-        except Exception as e:
-            return f"❌ Error getting models: {str(e)}"
+        """Show favourite models grouped by provider."""
+        if not self._favourite_models:
+            return "❌ No favourite models configured.\n\nSet TELEGRAM_FAVOURITE_MODELS environment variable."
+        
+        # Get current model info
+        current_info = ""
+        if self._get_model_callback:
+            current = self._get_model_callback()
+            if current:
+                current_info = f"*Current:* `{current[0]}/{current[1]}`\n\n"
+        
+        # Group favourite models by provider
+        providers: dict[str, list[str]] = {}
+        for provider_id, model_id in self._favourite_models:
+            if provider_id not in providers:
+                providers[provider_id] = []
+            providers[provider_id].append(model_id)
+        
+        lines = ["🤖 *Favourite Models*", ""]
+        if current_info:
+            lines.append(current_info)
+        
+        for provider_id in sorted(providers.keys()):
+            models = providers[provider_id]
+            lines.append(f"**{provider_id}**")
+            for model_id in models:
+                lines.append(f"  • `{model_id}`")
+            lines.append("")
+        
+        lines.append("Use `/set_model` to change model.")
+        return "\n".join(lines)
 
     async def cmd_agents(self, args: str) -> str:
         try:
@@ -1046,12 +1137,79 @@ class CommandHandler:
         except Exception as e:
             return f"❌ Error initializing session: {str(e)}"
 
-    async def cmd_set_model(self, args: str) -> str:
+    async def cmd_set_model(self, args: str) -> Union[str, CommandResponse]:
+        """Set or select a model for the current session. Shows only favourite models."""
+        
         if not args:
-            return "❌ Usage: `/set-model <provider/model>`\n\nExample: `/set-model deepseek/deepseek-reasoner`"
+            # Show current model and favourite models picker
+            current_info = ""
+            if self._get_model_callback:
+                current = self._get_model_callback()
+                if current:
+                    current_info = f"*Current model:* `{current[0]}/{current[1]}`\n\n"
+            
+            if self._favourite_models:
+                # Group favourite models by provider
+                providers: dict[str, list[str]] = {}
+                for provider_id, model_id in self._favourite_models:
+                    if provider_id not in providers:
+                        providers[provider_id] = []
+                    providers[provider_id].append(model_id)
+                
+                # Create inline keyboard: single column with model buttons, grouped by provider
+                keyboard: list[list[dict[str, str]]] = []
+                for provider_id in sorted(providers.keys()):
+                    models = providers[provider_id]
+                    # Add a header with provider name for each provider group
+                    keyboard.append([{"text": f"─── {provider_id} ───", "callback_data": "ignore"}])
+                    # Add model buttons (single column)
+                    for model_id in models:
+                        keyboard.append([{
+                            "text": f"• {model_id}",
+                            "callback_data": self._make_model_callback(provider_id, model_id)
+                        }])
+                
+                text = f"🤖 *Select a Model*\n\n{current_info}Tap a model to select, or type:\n`/set_model <provider/model>`"
+                return CommandResponse(text=text, keyboard=keyboard)
+            else:
+                return f"{current_info}❌ No favourite models configured.\n\nSet TELEGRAM_FAVOURITE_MODELS or use:\n`/set-model <provider/model>`"
 
-        # This is informational - the model is set per message
-        return f"ℹ️ To use a specific model, include it when sending prompts:\n\n`/prompt <message> --model {args}`\n\nOr create a new session:\n`/session {args}`"
+        # User provided an argument - set model directly
+        args = args.strip()
+        
+        # Check for provider/model format
+        if "/" in args:
+            parts = args.split("/", 1)
+            provider_id = parts[0].strip()
+            model_id = parts[1].strip()
+        else:
+            # Try to infer provider from model name
+            model_id = args
+            provider_id = None
+            
+            if model_id.lower().startswith("gpt") or model_id.startswith("o1") or model_id.startswith("o3"):
+                provider_id = "openai"
+            elif model_id.lower().startswith("claude"):
+                provider_id = "anthropic"
+            elif model_id.lower().startswith("deepseek"):
+                provider_id = "deepseek"
+            elif model_id.lower().startswith("gemini"):
+                provider_id = "google"
+            elif model_id.lower().startswith("minimax"):
+                provider_id = "minimax"
+            elif model_id.lower().startswith("kimi"):
+                provider_id = "moonshotai-cn"
+            elif model_id.lower().startswith("glm"):
+                provider_id = "zhipuai-coding-plan"
+            
+            if not provider_id:
+                return f"❌ Could not infer provider for `{model_id}`\n\nUse format: `/set_model <provider>/<model>`"
+        
+        if self._set_model_callback:
+            self._set_model_callback(provider_id, model_id)
+            return f"✅ Model set to `{provider_id}/{model_id}`\n\nAll subsequent prompts will use this model."
+        else:
+            return f"⚠️ Model callback not available."
 
     async def cmd_pending(self, args: str) -> str:
         """Show pending questions and permissions."""

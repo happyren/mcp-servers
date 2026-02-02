@@ -265,6 +265,23 @@ When the bridge service is enabled (`--enable-bridge`), you can control OpenCode
 
 **Note**: Any message not starting with `/` is sent as a prompt to the current session.
 
+### Interactive Inline Keyboards
+
+Several commands and interactions use **Telegram Inline Keyboards** for a better user experience:
+
+| Interaction | Description |
+|-------------|-------------|
+| **Session Selection** | `/sessions` shows clickable buttons for each session - tap to switch |
+| **Model Selection** | `/set_model` (without args) shows favourite models as buttons |
+| **Permission Requests** | When OpenCode needs permission, buttons appear: Allow / Always / Reject |
+| **Question Prompts** | When OpenCode asks questions, options appear as clickable buttons |
+
+**How it works:**
+- Inline keyboards are sent **once** per interaction - no duplicates
+- Users **must click a button** to respond (text input is not accepted for keyboard prompts)
+- After clicking, the original message updates to show the result
+- A brief toast notification confirms the action
+
 ### Bot Command Registration
 
 To make commands appear in Telegram's command menu (when users type `/`), register them using:

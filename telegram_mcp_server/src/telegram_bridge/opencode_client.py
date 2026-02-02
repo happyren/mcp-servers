@@ -84,6 +84,89 @@ class OpenCodeClient:
         response.raise_for_status()
         return response.json()
 
+    async def get_connected_models(self) -> list[tuple[str, str, str]]:
+        """Get list of available models from connected providers.
+        
+        Returns:
+            List of tuples (provider_id, model_id, display_name)
+        """
+        try:
+            data = await self.get_provider_list()
+            connected_ids = set(data.get("connected", []))
+            all_providers = data.get("all", [])
+            
+            models = []
+            for provider in all_providers:
+                provider_id = provider.get("id", "")
+                if provider_id not in connected_ids:
+                    continue
+                    
+                provider_models = provider.get("models", {})
+                if isinstance(provider_models, dict):
+                    for model_id in provider_models.keys():
+                        display_name = f"{provider_id}/{model_id}"
+                        models.append((provider_id, model_id, display_name))
+            
+            return models
+        except Exception as e:
+            logger.warning(f"Failed to get connected models: {e}")
+            return []
+
+    def fuzzy_match_model(
+        self, query: str, models: list[tuple[str, str, str]]
+    ) -> list[tuple[str, str, str, float]]:
+        """Fuzzy match a query against available models.
+        
+        Args:
+            query: The user's search query
+            models: List of (provider_id, model_id, display_name) tuples
+            
+        Returns:
+            List of (provider_id, model_id, display_name, score) sorted by score desc
+        """
+        query_lower = query.lower().replace("-", "").replace("_", "").replace(" ", "")
+        results = []
+        
+        for provider_id, model_id, display_name in models:
+            # Normalize for comparison
+            provider_lower = provider_id.lower()
+            model_lower = model_id.lower().replace("-", "").replace("_", "")
+            display_lower = display_name.lower().replace("-", "").replace("_", "")
+            
+            score = 0.0
+            
+            # Exact match on full display name
+            if query_lower == display_lower.replace("/", ""):
+                score = 1.0
+            # Exact match on model ID
+            elif query_lower == model_lower:
+                score = 0.95
+            # Query is prefix of model
+            elif model_lower.startswith(query_lower):
+                score = 0.9
+            # Query is contained in model
+            elif query_lower in model_lower:
+                score = 0.8
+            # Query is contained in display name
+            elif query_lower in display_lower:
+                score = 0.7
+            # Model contains query (substring)
+            elif any(part in model_lower for part in query_lower.split()):
+                score = 0.5
+            # Check for partial matches (e.g., "m2.1" matches "MiniMax-M2.1")
+            else:
+                # Calculate similarity based on common characters
+                common = sum(1 for c in query_lower if c in model_lower)
+                if common > 0:
+                    score = (common / max(len(query_lower), len(model_lower))) * 0.4
+            
+            if score > 0.1:
+                results.append((provider_id, model_id, display_name, score))
+        
+        # Sort by score descending
+        results.sort(key=lambda x: x[3], reverse=True)
+        return results[:10]  # Return top 10 matches
+
     # Session APIs
     async def list_sessions(self) -> list[dict[str, Any]]:
         """List all sessions."""
@@ -267,10 +350,12 @@ class OpenCodeClient:
             body: dict[str, Any] = {"reply": reply}
             if message:
                 body["message"] = message
-            response = await self.client.post(
-                f"{self.base_url}/permission/{request_id}/reply",
-                json=body,
-            )
+            url = f"{self.base_url}/permission/{request_id}/reply"
+            logger.info(f"Calling POST {url} with body={body}")
+            response = await self.client.post(url, json=body)
+            logger.info(f"Permission reply response: status={response.status_code}")
+            if response.status_code != 200:
+                logger.error(f"Permission reply error body: {response.text[:500] if response.text else 'empty'}")
             response.raise_for_status()
             return True
         except Exception as e:

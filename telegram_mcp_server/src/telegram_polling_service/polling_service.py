@@ -88,38 +88,82 @@ class TelegramPollingService:
             json.dump(data, f, indent=2)
 
     async def poll_once(self) -> None:
-        """Poll Telegram once for new messages."""
+        """Poll Telegram once for new messages and callback queries."""
         try:
-            messages = await self.client.get_new_messages(timeout=30)
+            # Use get_updates_with_callbacks to get both messages and button clicks
+            updates = await self.client.get_updates_with_callbacks(timeout=30)
 
-            if not messages:
-                polling_logger.debug("No new messages")
+            if not updates:
+                polling_logger.debug("No new updates")
                 return
 
-            polling_logger.info(f"Received {len(messages)} new message(s)")
+            polling_logger.info(f"Received {len(updates)} new update(s)")
 
             # Read existing queue
             queue = self._read_queue()
 
-            # Add new messages to queue if not already processed
-            for msg in messages:
-                if msg.message_id not in self.processed_ids:
-                    msg_dict = {
-                        "message_id": msg.message_id,
-                        "chat_id": msg.chat_id,
-                        "from_user_id": msg.from_user_id,
-                        "from_username": msg.from_username,
-                        "text": msg.text,
-                        "date": msg.date,
-                        "received_at": datetime.now().isoformat(),
-                        "raw": msg.raw,
-                    }
-                    queue.append(msg_dict)
-                    self.processed_ids.add(msg.message_id)
-                    polling_logger.info(
-                        f"Queued message {msg.message_id} from {msg.from_username}: "
-                        f"{msg.text[:50] if msg.text else 'No text'}"
-                    )
+            # Process each update
+            for update in updates:
+                update_id = update.get("update_id", 0)
+                
+                # Track update_id for offset
+                if hasattr(self.client, '_last_update_id'):
+                    if self.client._last_update_id is None or update_id >= self.client._last_update_id:
+                        self.client._last_update_id = update_id + 1
+                
+                # Handle regular messages
+                msg_data = update.get("message")
+                if msg_data:
+                    msg_id = msg_data.get("message_id", 0)
+                    if msg_id not in self.processed_ids:
+                        from_user = msg_data.get("from", {})
+                        msg_dict = {
+                            "message_id": msg_id,
+                            "chat_id": msg_data.get("chat", {}).get("id", 0),
+                            "from_user_id": from_user.get("id"),
+                            "from_username": from_user.get("username"),
+                            "text": msg_data.get("text"),
+                            "date": msg_data.get("date", 0),
+                            "received_at": datetime.now().isoformat(),
+                            "type": "message",
+                            "raw": msg_data,
+                        }
+                        queue.append(msg_dict)
+                        self.processed_ids.add(msg_id)
+                        polling_logger.info(
+                            f"Queued message {msg_id} from {from_user.get('username')}: "
+                            f"{msg_dict['text'][:50] if msg_dict['text'] else 'No text'}"
+                        )
+                
+                # Handle callback queries (button clicks)
+                callback_data = update.get("callback_query")
+                if callback_data:
+                    callback_id = callback_data.get("id", "")
+                    # Use a unique ID combining update_id and callback_id
+                    unique_id = hash(f"callback:{update_id}:{callback_id}")
+                    if unique_id not in self.processed_ids:
+                        from_user = callback_data.get("from", {})
+                        message = callback_data.get("message", {})
+                        callback_dict = {
+                            "message_id": unique_id,  # Use unique hash as ID
+                            "chat_id": message.get("chat", {}).get("id", 0),
+                            "from_user_id": from_user.get("id"),
+                            "from_username": from_user.get("username"),
+                            "text": None,  # Callback queries don't have text
+                            "callback_data": callback_data.get("data", ""),
+                            "callback_query_id": callback_id,
+                            "original_message_id": message.get("message_id"),
+                            "date": message.get("date", 0),
+                            "received_at": datetime.now().isoformat(),
+                            "type": "callback_query",
+                            "raw": callback_data,
+                        }
+                        queue.append(callback_dict)
+                        self.processed_ids.add(unique_id)
+                        polling_logger.info(
+                            f"Queued callback query from {from_user.get('username')}: "
+                            f"{callback_data.get('data', 'No data')[:50]}"
+                        )
 
             # Write updated queue
             self._write_queue(queue)

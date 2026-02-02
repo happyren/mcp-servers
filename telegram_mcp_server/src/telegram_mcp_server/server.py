@@ -1020,6 +1020,7 @@ def run_bridge_service(
             bot_token=settings.bot_token,
             provider_id=provider_id,
             model_id=model_id,
+            favourite_models=settings.get_favourite_models(),
         )
         bridge.running = True
         

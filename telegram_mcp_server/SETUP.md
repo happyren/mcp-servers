@@ -203,6 +203,22 @@ See [README.md](README.md#telegram-commands) for the complete list of 35+ Telegr
 - Configuration (models, agents, auth)
 - System status (health, LSP, formatters, MCP)
 
+### Interactive Inline Keyboards
+
+The bridge uses **Telegram Inline Keyboards** for interactive prompts:
+
+| Interaction | How to respond |
+|-------------|----------------|
+| **Session list** (`/sessions`) | Tap a session button to switch |
+| **Model picker** (`/set_model`) | Tap a model button to select |
+| **Permission requests** | Tap Allow, Always, or Reject |
+| **Question prompts** | Tap one of the option buttons |
+
+**Important:**
+- When buttons are shown, you **must click a button** to respond
+- Typing a text reply will NOT work for button prompts
+- After clicking, the message updates to show your selection
+
 ---
 
 ## Troubleshooting

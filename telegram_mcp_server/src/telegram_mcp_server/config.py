@@ -32,6 +32,22 @@ class Settings(BaseSettings):
         default=False,
         description="Whether bot commands have been registered with Telegram. Set to true after running set_bot_commands.",
     )
+    favourite_models: str = Field(
+        default="deepseek/deepseek-reasoner,deepseek/deepseek-chat",
+        description="Comma-separated list of favourite models in 'provider/model' format. These are shown in /models and model picker.",
+    )
+
+    def get_favourite_models(self) -> list[tuple[str, str]]:
+        """Parse favourite_models into a list of (provider, model) tuples."""
+        if not self.favourite_models:
+            return []
+        result = []
+        for item in self.favourite_models.split(","):
+            item = item.strip()
+            if "/" in item:
+                parts = item.split("/", 1)
+                result.append((parts[0].strip(), parts[1].strip()))
+        return result
 
     class Config:
         env_file = ".env"

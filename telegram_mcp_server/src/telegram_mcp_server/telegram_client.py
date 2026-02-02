@@ -619,3 +619,116 @@ class TelegramClient:
             "sendChatAction", {"chat_id": chat_id, "action": "typing"}
         )
         return True
+
+    async def send_message_with_keyboard(
+        self,
+        chat_id: str | int,
+        text: str,
+        inline_keyboard: list[list[dict[str, str]]],
+        parse_mode: str | None = "Markdown",
+    ) -> dict[str, Any]:
+        """Send a message with an inline keyboard.
+
+        Args:
+            chat_id: The chat ID
+            text: The message text
+            inline_keyboard: List of button rows, each row is a list of buttons.
+                            Each button is a dict with 'text' and 'callback_data'.
+            parse_mode: Parse mode
+
+        Returns:
+            The sent message information
+        """
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": {"inline_keyboard": inline_keyboard},
+        }
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+
+        return await self._request_with_retry("sendMessage", params, is_read=False)
+
+    async def edit_message_with_keyboard(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        inline_keyboard: list[list[dict[str, str]]] | None = None,
+        parse_mode: str | None = "Markdown",
+    ) -> dict[str, Any]:
+        """Edit a message, optionally updating or removing the inline keyboard.
+
+        Args:
+            chat_id: The chat ID
+            message_id: The message ID to edit
+            text: New message text
+            inline_keyboard: New keyboard (None to remove keyboard)
+            parse_mode: Parse mode
+
+        Returns:
+            The edited message information
+        """
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        }
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+        if inline_keyboard is not None:
+            params["reply_markup"] = {"inline_keyboard": inline_keyboard}
+
+        return await self._request_with_retry("editMessageText", params, is_read=False)
+
+    async def answer_callback_query(
+        self,
+        callback_query_id: str,
+        text: str | None = None,
+        show_alert: bool = False,
+    ) -> bool:
+        """Answer a callback query (button click).
+
+        Args:
+            callback_query_id: The callback query ID
+            text: Optional text to show to the user
+            show_alert: If True, show as alert instead of toast
+
+        Returns:
+            True if successful
+        """
+        params: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            params["text"] = text
+        if show_alert:
+            params["show_alert"] = show_alert
+
+        await self._request_with_retry("answerCallbackQuery", params, is_read=False)
+        return True
+
+    async def get_updates_with_callbacks(
+        self,
+        offset: int | None = None,
+        limit: int = 100,
+        timeout: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Get updates including callback queries (button clicks).
+
+        Args:
+            offset: Identifier of the first update to return
+            limit: Maximum number of updates
+            timeout: Long polling timeout in seconds
+
+        Returns:
+            List of updates
+        """
+        params: dict[str, Any] = {
+            "limit": limit,
+            "timeout": timeout,
+            "allowed_updates": ["message", "callback_query"],
+        }
+        if offset is not None:
+            params["offset"] = offset
+
+        result = await self._request_with_retry("getUpdates", params)
+        return result if isinstance(result, list) else []
