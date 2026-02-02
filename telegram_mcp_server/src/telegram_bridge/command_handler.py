@@ -122,7 +122,7 @@ class CommandHandler:
 
 ⚙️ *Configuration*
 `/config` - Get current config
-`/models` - List available models/providers
+`/models [model]` - List models (tap to select) or set model
 `/agents` - List available agents
 `/login <provider>` - Authenticate with provider (interactive)
 `/commands` - List all OpenCode commands
@@ -218,10 +218,6 @@ class CommandHandler:
             "info": self.cmd_info,
             "messages": self.cmd_messages,
             "init": self.cmd_init,
-            "set-model": self.cmd_set_model,
-            "set_model": self.cmd_set_model,
-            "use-model": self.cmd_set_model,  # Alias
-            "use_model": self.cmd_set_model,  # Alias
             "pending": self.cmd_pending,
         }
 
@@ -949,8 +945,48 @@ class CommandHandler:
         except Exception as e:
             return f"❌ Error getting config: {str(e)}"
 
-    async def cmd_models(self, args: str) -> str:
-        """Show favourite models grouped by provider."""
+    async def cmd_models(self, args: str) -> Union[str, CommandResponse]:
+        """Show favourite models with selection buttons, or set model directly."""
+        
+        # If args provided, set model directly (like old set_model behavior)
+        if args:
+            args = args.strip()
+            
+            # Check for provider/model format
+            if "/" in args:
+                parts = args.split("/", 1)
+                provider_id = parts[0].strip()
+                model_id = parts[1].strip()
+            else:
+                # Try to infer provider from model name
+                model_id = args
+                provider_id = None
+                
+                if model_id.lower().startswith("gpt") or model_id.startswith("o1") or model_id.startswith("o3"):
+                    provider_id = "openai"
+                elif model_id.lower().startswith("claude"):
+                    provider_id = "anthropic"
+                elif model_id.lower().startswith("deepseek"):
+                    provider_id = "deepseek"
+                elif model_id.lower().startswith("gemini"):
+                    provider_id = "google"
+                elif model_id.lower().startswith("minimax"):
+                    provider_id = "minimax"
+                elif model_id.lower().startswith("kimi"):
+                    provider_id = "moonshotai-cn"
+                elif model_id.lower().startswith("glm"):
+                    provider_id = "zhipuai-coding-plan"
+                
+                if not provider_id:
+                    return f"❌ Could not infer provider for `{model_id}`\n\nUse format: `/models <provider>/<model>`"
+            
+            if self._set_model_callback:
+                self._set_model_callback(provider_id, model_id)
+                return f"✅ Model set to `{provider_id}/{model_id}`\n\nAll subsequent prompts will use this model."
+            else:
+                return f"⚠️ Model callback not available."
+        
+        # No args - show current model and favourite models picker
         if not self._favourite_models:
             return "❌ No favourite models configured.\n\nSet TELEGRAM_FAVOURITE_MODELS environment variable."
         
@@ -968,19 +1004,21 @@ class CommandHandler:
                 providers[provider_id] = []
             providers[provider_id].append(model_id)
         
-        lines = ["🤖 *Favourite Models*", ""]
-        if current_info:
-            lines.append(current_info)
-        
+        # Create inline keyboard: single column with model buttons, grouped by provider
+        keyboard: list[list[dict[str, str]]] = []
         for provider_id in sorted(providers.keys()):
             models = providers[provider_id]
-            lines.append(f"**{provider_id}**")
+            # Add a header with provider name for each provider group
+            keyboard.append([{"text": f"─── {provider_id} ───", "callback_data": "ignore"}])
+            # Add model buttons (single column)
             for model_id in models:
-                lines.append(f"  • `{model_id}`")
-            lines.append("")
+                keyboard.append([{
+                    "text": f"• {model_id}",
+                    "callback_data": self._make_model_callback(provider_id, model_id)
+                }])
         
-        lines.append("Use `/set_model` to change model.")
-        return "\n".join(lines)
+        text = f"🤖 *Models*\n\n{current_info}Tap to select, or use:\n`/models <provider>/<model>`"
+        return CommandResponse(text=text, keyboard=keyboard)
 
     async def cmd_agents(self, args: str) -> str:
         try:
@@ -1148,80 +1186,6 @@ class CommandHandler:
             return f"✅ Analyzing app and creating AGENTS.md...\n\nThis may take a moment."
         except Exception as e:
             return f"❌ Error initializing session: {str(e)}"
-
-    async def cmd_set_model(self, args: str) -> Union[str, CommandResponse]:
-        """Set or select a model for the current session. Shows only favourite models."""
-        
-        if not args:
-            # Show current model and favourite models picker
-            current_info = ""
-            if self._get_model_callback:
-                current = self._get_model_callback()
-                if current:
-                    current_info = f"*Current model:* `{current[0]}/{current[1]}`\n\n"
-            
-            if self._favourite_models:
-                # Group favourite models by provider
-                providers: dict[str, list[str]] = {}
-                for provider_id, model_id in self._favourite_models:
-                    if provider_id not in providers:
-                        providers[provider_id] = []
-                    providers[provider_id].append(model_id)
-                
-                # Create inline keyboard: single column with model buttons, grouped by provider
-                keyboard: list[list[dict[str, str]]] = []
-                for provider_id in sorted(providers.keys()):
-                    models = providers[provider_id]
-                    # Add a header with provider name for each provider group
-                    keyboard.append([{"text": f"─── {provider_id} ───", "callback_data": "ignore"}])
-                    # Add model buttons (single column)
-                    for model_id in models:
-                        keyboard.append([{
-                            "text": f"• {model_id}",
-                            "callback_data": self._make_model_callback(provider_id, model_id)
-                        }])
-                
-                text = f"🤖 *Select a Model*\n\n{current_info}Tap a model to select, or type:\n`/set_model <provider/model>`"
-                return CommandResponse(text=text, keyboard=keyboard)
-            else:
-                return f"{current_info}❌ No favourite models configured.\n\nSet TELEGRAM_FAVOURITE_MODELS or use:\n`/set-model <provider/model>`"
-
-        # User provided an argument - set model directly
-        args = args.strip()
-        
-        # Check for provider/model format
-        if "/" in args:
-            parts = args.split("/", 1)
-            provider_id = parts[0].strip()
-            model_id = parts[1].strip()
-        else:
-            # Try to infer provider from model name
-            model_id = args
-            provider_id = None
-            
-            if model_id.lower().startswith("gpt") or model_id.startswith("o1") or model_id.startswith("o3"):
-                provider_id = "openai"
-            elif model_id.lower().startswith("claude"):
-                provider_id = "anthropic"
-            elif model_id.lower().startswith("deepseek"):
-                provider_id = "deepseek"
-            elif model_id.lower().startswith("gemini"):
-                provider_id = "google"
-            elif model_id.lower().startswith("minimax"):
-                provider_id = "minimax"
-            elif model_id.lower().startswith("kimi"):
-                provider_id = "moonshotai-cn"
-            elif model_id.lower().startswith("glm"):
-                provider_id = "zhipuai-coding-plan"
-            
-            if not provider_id:
-                return f"❌ Could not infer provider for `{model_id}`\n\nUse format: `/set_model <provider>/<model>`"
-        
-        if self._set_model_callback:
-            self._set_model_callback(provider_id, model_id)
-            return f"✅ Model set to `{provider_id}/{model_id}`\n\nAll subsequent prompts will use this model."
-        else:
-            return f"⚠️ Model callback not available."
 
     async def cmd_pending(self, args: str) -> str:
         """Show pending questions and permissions."""

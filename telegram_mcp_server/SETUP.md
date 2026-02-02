@@ -161,7 +161,7 @@ python set_commands.py
 ```
 
 ### What This Does
-- Registers all 38+ slash commands (from `/help` to `/set_model`) with Telegram
+- Registers all 35+ slash commands (from `/help` to `/pending`) with Telegram
 - Commands will appear in Telegram's command menu when users type `/`
 - Uses the "default" scope (available to all users)
 - Can be customized with different scopes (private chats, groups, specific chats)
@@ -210,7 +210,7 @@ The bridge uses **Telegram Inline Keyboards** for interactive prompts:
 | Interaction | How to respond |
 |-------------|----------------|
 | **Session list** (`/sessions`) | Tap a session button to switch |
-| **Model picker** (`/set_model`) | Tap a model button to select |
+| **Model picker** (`/models`) | Tap a model button to select |
 | **Permission requests** | Tap Allow, Always, or Reject |
 | **Question prompts** | Tap one of the option buttons |
 

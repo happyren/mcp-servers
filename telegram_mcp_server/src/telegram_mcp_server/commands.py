@@ -41,7 +41,7 @@ def get_bot_commands() -> List[Dict[str, str]]:
         {"command": "unrevert", "description": "Restore reverted messages"},
         {"command": "summarize", "description": "Summarize session"},
         {"command": "config", "description": "Get current config"},
-        {"command": "models", "description": "List available models/providers"},
+        {"command": "models", "description": "List models (tap to select) or set model"},
         {"command": "agents", "description": "List available agents"},
         {"command": "login", "description": "Authenticate with provider"},
         {"command": "vcs", "description": "Get VCS info"},
@@ -52,5 +52,4 @@ def get_bot_commands() -> List[Dict[str, str]]:
         {"command": "info", "description": "Get session details"},
         {"command": "messages", "description": "List messages in session"},
         {"command": "init", "description": "Analyze app and create AGENTS.md"},
-        {"command": "set_model", "description": "Set model for session"},
     ]

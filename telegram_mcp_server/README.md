@@ -246,12 +246,11 @@ When the bridge service is enabled (`--enable-bridge`), you can control OpenCode
 | Command | Description |
 |---------|-------------|
 | `/config` | Get current config |
-| `/models` | List available models/providers |
+| `/models [model]` | List models (tap to select) or set model |
 | `/agents` | List available agents |
 | `/login <provider>` | Authenticate with a provider |
 | `/commands` | List all OpenCode slash commands |
 | `/pending` | Show pending questions & permissions |
-| `/set_model` | Set model for session (alias: `/set-model`, `/use-model`, `/use_model`) |
 
 ### System Commands
 
@@ -272,7 +271,7 @@ Several commands and interactions use **Telegram Inline Keyboards** for a better
 | Interaction | Description |
 |-------------|-------------|
 | **Session Selection** | `/sessions` shows clickable buttons for each session - tap to switch |
-| **Model Selection** | `/set_model` (without args) shows favourite models as buttons |
+| **Model Selection** | `/models` shows favourite models as buttons - tap to select |
 | **Permission Requests** | When OpenCode needs permission, buttons appear: Allow / Always / Reject |
 | **Question Prompts** | When OpenCode asks questions, options appear as clickable buttons |
 

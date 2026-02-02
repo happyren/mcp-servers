@@ -308,6 +308,9 @@ class TelegramOpenCodeBridge:
         
         # Track the chat_id for the current session (for question/permission forwarding)
         self.current_chat_id: int | None = None
+        
+        # Track sessions that have already had their title updated after first message
+        self.sessions_titled: set[str] = set()
 
         # In-memory queue for faster processing (loaded from file on startup)
         self._in_memory_queue: list[dict[str, Any]] = []
@@ -351,6 +354,8 @@ class TelegramOpenCodeBridge:
                 self.pending_permissions = {int(k): v for k, v in pending_perms.items()}
                 # Load current chat_id
                 self.current_chat_id = data.get("current_chat_id")
+                # Load sessions that have been titled
+                self.sessions_titled = set(data.get("sessions_titled", []))
                 # Load model cache and sync to command handler
                 model_cache = data.get("model_cache", {})
                 if model_cache:
@@ -379,6 +384,7 @@ class TelegramOpenCodeBridge:
             "pending_questions": pending_q_serializable,
             "pending_permissions": pending_p_serializable,
             "current_chat_id": self.current_chat_id,
+            "sessions_titled": list(self.sessions_titled),
             "model_cache": model_cache_serializable,
             "last_updated": datetime.now().isoformat(),
         }
@@ -416,6 +422,34 @@ class TelegramOpenCodeBridge:
     def _get_session_model(self) -> tuple[str, str] | None:
         """Get the current session model (callback for CommandHandler)."""
         return self.session_model
+
+    def _generate_session_title(self, user_message: str, max_length: int = 50) -> str:
+        """Generate a session title from the user's first message.
+        
+        Creates a concise, readable title by extracting the key intent
+        from the user's message.
+        
+        Args:
+            user_message: The user's first message text
+            max_length: Maximum title length (default 50 chars)
+            
+        Returns:
+            A formatted session title
+        """
+        # Clean up the message - remove extra whitespace
+        text = " ".join(user_message.split())
+        
+        # If it's short enough, use it directly
+        if len(text) <= max_length:
+            return text
+        
+        # Truncate at a word boundary
+        truncated = text[:max_length]
+        last_space = truncated.rfind(" ")
+        if last_space > max_length // 2:  # Only break at word if we keep at least half
+            truncated = truncated[:last_space]
+        
+        return truncated + "..."
 
     def _read_queue(self) -> list[dict[str, Any]]:
         """Read messages from queue file with intelligent caching.
@@ -761,6 +795,18 @@ class TelegramOpenCodeBridge:
                         current_msg_id=msg_id,
                     )
                     logger.info(f"OpenCode response received for message {msg_id}")
+
+                    # Update session title after first message if not already titled
+                    if session_id and session_id not in self.sessions_titled:
+                        try:
+                            title = self._generate_session_title(text)
+                            await self.opencode.update_session(session_id, title=title)
+                            self.sessions_titled.add(session_id)
+                            asyncio.create_task(self._schedule_save_state())
+                            logger.info(f"Updated session {session_id[:8]}... title to: {title}")
+                        except Exception as e:
+                            logger.warning(f"Failed to update session title: {e}")
+                            # Don't fail the whole message - title update is optional
 
                     # Note: Pending questions/permissions are now ONLY handled during
                     # the typing loop in _poll_and_forward_pending(). This prevents
