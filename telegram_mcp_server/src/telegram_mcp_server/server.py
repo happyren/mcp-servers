@@ -980,16 +980,13 @@ def run_polling_service():
         try:
             while not _shutdown_event.is_set():
                 await service.poll_once()
-                # Check shutdown more frequently
-                for _ in range(10):
-                    if _shutdown_event.is_set():
-                        break
-                    await asyncio.sleep(1)
+                await asyncio.sleep(1)  # Poll every 1 second for fast response
         except Exception as e:
             logger.error(f"Polling service error: {e}")
         finally:
             await service.client.close()
-            service._save_processed_ids()
+            if hasattr(service, '_save_offset'):
+                service._save_offset(service.last_offset)
             logger.info("Background polling service stopped")
     
     # Create a new event loop for this thread
