@@ -73,6 +73,9 @@ class OpenCodeInstance:
     # Whether browser has been opened for this instance
     browser_opened: bool = False
     
+    # Instance type (opencode, quantcode, etc.) for factory-based spawning
+    instance_type: str = "opencode"
+    
     @property
     def url(self) -> str:
         """Get the HTTP API URL for this instance."""
@@ -123,6 +126,7 @@ class OpenCodeInstance:
             "restart_count": self.restart_count,
             "error_message": self.error_message,
             "browser_opened": self.browser_opened,
+            "instance_type": self.instance_type,
         }
     
     @classmethod
@@ -152,6 +156,7 @@ class OpenCodeInstance:
             restart_count=data.get("restart_count", 0),
             error_message=data.get("error_message"),
             browser_opened=data.get("browser_opened", False),
+            instance_type=data.get("instance_type", "opencode"),
         )
     
     def __hash__(self) -> int:

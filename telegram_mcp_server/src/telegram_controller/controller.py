@@ -5,6 +5,8 @@ The Controller is a standalone daemon that:
 2. Routes messages to the appropriate OpenCode instance
 3. Spawns/manages multiple OpenCode instances
 4. Sends responses back to Telegram
+
+Supports multi-bot architecture with pluggable instance factories.
 """
 
 import argparse
@@ -34,6 +36,8 @@ from .session_router import SessionRouter
 from .notifications import NotificationManager
 from .handlers import ControllerCommands, CallbackHandler, MessageHandler
 from .handlers.commands import CommandResponse
+from .instance_factories import get_registry
+from .config_schema import MultiBotConfig, load_config, get_default_config
 
 # Configure logging
 logging.basicConfig(
@@ -50,16 +54,15 @@ DEFAULT_MODEL_ID = "deepseek-reasoner"
 
 # Default favourite models for model picker
 DEFAULT_FAVOURITE_MODELS = [
-    ("github-copilot", "claude-sonnet-4"),
-    ("github-copilot", "gpt-4.1"),
+    ("minimax-cn", "MiniMax-M2.1"),
+    ("moonshotai-cn", "kimi-k2.5"),
+    ("zhipuai", "glm-4.7"),
     ("deepseek", "deepseek-reasoner"),
     ("deepseek", "deepseek-chat"),
-    ("anthropic", "claude-sonnet-4-20250514"),
+    ("opencode", "big-pickle"),
+    ("opencode", "minimax-m2.1-free"),
     ("github-copilot", "claude-opus-4.5"),
-    ("github-copilot", "claude-sonnet-4.5"),
-    ("moonshotai-cn", "kimi-k2.5"),
-    ("minimax", "minimax-m2.1"),
-    ("zhipuai-coding-plan", "GLM-4.7"),
+    ("google", "gemini-3-pro-preview"),
 ]
 
 
@@ -79,6 +82,7 @@ class TelegramController:
         state_dir: Optional[Path] = None,
         default_provider: str = DEFAULT_MODEL_PROVIDER,
         default_model: str = DEFAULT_MODEL_ID,
+        config_path: Optional[str] = None,
     ):
         """Initialize the controller.
         
@@ -86,9 +90,37 @@ class TelegramController:
             state_dir: Directory for state persistence
             default_provider: Default AI provider for new instances
             default_model: Default AI model for new instances
+            config_path: Optional path to multi-bot YAML config file
         """
         self.state_dir = state_dir or Path("~/.local/share/telegram_controller").expanduser()
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Load multi-bot config if provided
+        self.multi_bot_config: Optional[MultiBotConfig] = None
+        if config_path:
+            try:
+                self.multi_bot_config = load_config(config_path)
+                logger.info(f"Loaded multi-bot config from {config_path}")
+                
+                # Override defaults from config
+                if self.multi_bot_config.controller.state_dir:
+                    self.state_dir = self.multi_bot_config.controller.state_dir
+                if self.multi_bot_config.controller.default_provider:
+                    default_provider = self.multi_bot_config.controller.default_provider
+                if self.multi_bot_config.controller.default_model:
+                    default_model = self.multi_bot_config.controller.default_model
+                
+                # Initialize factory registry from config
+                registry = get_registry()
+                registry.register_from_config(
+                    {k: v.model_dump() for k, v in self.multi_bot_config.instance_types.items()}
+                    if self.multi_bot_config.instance_types else {}
+                )
+                logger.info(f"Registered instance types: {registry.list_types()}")
+                
+            except Exception as e:
+                logger.warning(f"Failed to load multi-bot config: {e}")
+                self.multi_bot_config = None
         
         # Configuration
         self.settings = get_settings()
@@ -153,17 +185,11 @@ class TelegramController:
         logger.info(f"Controller initialized with state dir: {self.state_dir}")
     
     def _load_favourite_models(self) -> list[Tuple[str, str]]:
-        """Load favourite models from environment or use defaults."""
-        env_models = os.environ.get("TELEGRAM_FAVOURITE_MODELS", "")
-        if env_models:
-            models = []
-            for entry in env_models.split(","):
-                entry = entry.strip()
-                if "/" in entry:
-                    parts = entry.split("/", 1)
-                    models.append((parts[0].strip(), parts[1].strip()))
-            if models:
-                return models
+        """Load favourite models from settings or use defaults."""
+        # Use settings from config.py which handles env var TELEGRAM_FAVOURITE_MODELS
+        models = self.settings.get_favourite_models()
+        if models:
+            return models
         return DEFAULT_FAVOURITE_MODELS
     
     def _load_offset(self) -> int:
@@ -685,6 +711,13 @@ Environment variables:
         help="Directory for state persistence (default: ~/.local/share/telegram_controller)",
     )
     parser.add_argument(
+        "--config",
+        "-c",
+        type=str,
+        default=os.environ.get("TELEGRAM_CONTROLLER_CONFIG"),
+        help="Path to multi-bot YAML config file",
+    )
+    parser.add_argument(
         "--provider",
         default=os.environ.get("TELEGRAM_PROVIDER", DEFAULT_MODEL_PROVIDER),
         help=f"Default AI provider (default: {DEFAULT_MODEL_PROVIDER})",
@@ -714,6 +747,7 @@ async def async_main() -> None:
         state_dir=args.state_dir,
         default_provider=args.provider,
         default_model=args.model,
+        config_path=args.config,
     )
     
     await controller.run()

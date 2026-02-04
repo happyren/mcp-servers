@@ -343,6 +343,7 @@ The **Telegram Controller** is a standalone daemon that enables **multi-instance
 - **Switch between instances** with `/list` and `/switch`
 - **Receive notifications** for pending permissions and questions
 - **Support forum topics** in Telegram supergroups
+- **Multiple bot types** via factory registry (OpenCode, QuantCode, custom)
 
 ### Installation
 
@@ -357,6 +358,9 @@ telegram-controller --state-dir ~/.telegram-controller
 
 # Start with specific default model
 telegram-controller --provider deepseek --model deepseek-reasoner
+
+# Start with multi-bot YAML configuration
+telegram-controller --config config/controller.yaml
 ```
 
 ### Environment Variables
@@ -374,6 +378,7 @@ telegram-controller --provider deepseek --model deepseek-reasoner
 | Command | Description |
 |---------|-------------|
 | `/open <path>` | Open project directory in current thread |
+| `/open <path> --type <type>` | Open with specific instance type (e.g., `quantcode`) |
 | `/list` | List all running instances (tap to switch) |
 | `/switch [id]` | Switch to different instance |
 | `/current` | Show current instance details |
@@ -394,12 +399,139 @@ telegram-controller --provider deepseek --model deepseek-reasoner
 
 Each reply thread can be connected to a different project!
 
+### Multi-Bot Instance Types
+
+The controller supports multiple bot types through a **factory registry**. Use the `--type` argument with `/open`:
+
+```bash
+# Open a standard OpenCode instance (default)
+/open ~/projects/my-app
+
+# Open a QuantCode instance for financial analysis
+/open ~/quant/pipeline --type quantcode
+```
+
+**Built-in instance types:**
+- `opencode` - Standard OpenCode agentic coding instance (default)
+- `quantcode` - Financial news analysis with quantcode_core tools
+
 ### State Management
 
 The controller stores state in `~/.local/share/telegram_controller/`:
 - `instances.json` - Running instance metadata
 - `session_routes.json` - Thread-instance mappings
 - `polling_offset.json` - Telegram polling offset
+
+---
+
+## Multi-Bot Configuration (YAML)
+
+For advanced multi-bot setups, use a YAML configuration file:
+
+```yaml
+# config/controller.yaml
+bots:
+  - name: main
+    token: ${TELEGRAM_BOT_TOKEN}
+    chat_id: ${TELEGRAM_CHAT_ID}
+    default_instance_type: opencode
+
+instance_types:
+  opencode:
+    factory: opencode
+    default_provider: deepseek
+    default_model: deepseek-reasoner
+    
+  quantcode:
+    factory: quantcode
+    health_check_endpoint: /health
+    startup_timeout: 30
+
+# Custom factories loaded from Python modules
+custom_factories:
+  - module: my_custom_factory
+    class: MyFactoryClass
+    name: my-bot-type
+```
+
+### Configuration Options
+
+| Field | Description |
+|-------|-------------|
+| `bots` | List of Telegram bots to manage |
+| `bots[].name` | Bot identifier |
+| `bots[].token` | Bot token (supports `${ENV_VAR}` expansion) |
+| `bots[].chat_id` | Default chat ID |
+| `bots[].default_instance_type` | Default factory type for `/open` |
+| `instance_types` | Map of instance type names to configurations |
+| `custom_factories` | List of custom factory modules to load |
+
+### Environment Variable Expansion
+
+The config supports `${VAR_NAME}` syntax for environment variables:
+
+```yaml
+bots:
+  - token: ${TELEGRAM_BOT_TOKEN}    # Expands from environment
+    chat_id: ${TELEGRAM_CHAT_ID}
+```
+
+---
+
+## Factory Registry
+
+The factory registry manages instance factories for different bot types.
+
+### Built-in Factories
+
+| Factory | Description |
+|---------|-------------|
+| `opencode` | Standard OpenCode instance with HTTP API |
+| `quantcode` | QuantCode instance with financial analysis tools |
+
+### Custom Factories
+
+Create custom factories by implementing the `InstanceFactory` protocol:
+
+```python
+# my_factory.py
+from telegram_controller.instance_factories.registry import InstanceFactory
+
+class MyCustomFactory(InstanceFactory):
+    """Custom instance factory."""
+    
+    @property
+    def name(self) -> str:
+        return "my-custom-type"
+    
+    def get_spawn_command(self, path: str, **kwargs) -> list[str]:
+        """Return command to spawn instance."""
+        return ["my-bot", "--path", path]
+    
+    def get_health_check_url(self, port: int) -> str:
+        """Return health check URL."""
+        return f"http://localhost:{port}/health"
+    
+    async def wait_for_ready(self, port: int, timeout: float = 30.0) -> bool:
+        """Wait for instance to be ready."""
+        # Custom startup logic
+        return True
+```
+
+Register in config:
+
+```yaml
+custom_factories:
+  - module: my_factory
+    class: MyCustomFactory
+    name: my-custom-type
+```
+
+Then use:
+
+```bash
+/open ~/projects/my-app --type my-custom-type
+```
 
 ---
 
@@ -490,13 +622,24 @@ telegram_mcp_server/
 │   │   └── bridge_service.py  # OpenCode bridge service
 │   └── telegram_controller/
 │       ├── __init__.py
-│       ├── controller.py      # Main controller daemon
-│       ├── instance.py        # OpenCode instance representation
-│       ├── process_manager.py # Instance lifecycle management
-│       └── session_router.py  # Thread-instance routing
+│       ├── controller.py      # Main controller daemon (with --config support)
+│       ├── instance.py        # OpenCode instance representation (with instance_type)
+│       ├── process_manager.py # Instance lifecycle (with factory support)
+│       ├── session_router.py  # Thread-instance routing
+│       ├── config_schema.py   # Multi-bot YAML config schema
+│       ├── instance_factories/
+│       │   ├── __init__.py
+│       │   ├── registry.py    # Factory registry for multi-bot types
+│       │   ├── opencode.py    # OpenCode factory (default)
+│       │   └── quantcode.py   # QuantCode factory
+│       └── handlers/
+│           ├── __init__.py
+│           └── commands.py    # Command handlers (with --type support)
 ├── tests/
 │   ├── conftest.py
 │   └── test_validation.py
+├── config/
+│   └── controller.yaml        # Example multi-bot config
 ├── Dockerfile
 ├── docker-compose.yml
 ├── pyproject.toml

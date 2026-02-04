@@ -2,6 +2,8 @@
 
 Handles spawning, monitoring, and terminating OpenCode subprocess instances.
 Includes PID file management for orphan process cleanup after crashes.
+
+Now supports pluggable instance factories for multi-bot architecture.
 """
 
 import asyncio
@@ -13,7 +15,7 @@ import signal
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 
 import httpx
 
@@ -21,6 +23,7 @@ from .instance import InstanceState, OpenCodeInstance
 from .project_detector import detect_project_name
 from .pid_manager import PIDManager
 from .port_allocator import PortAllocator
+from .instance_factories import InstanceFactory, get_registry
 
 logger = logging.getLogger("telegram_controller.process_manager")
 
@@ -146,7 +149,10 @@ class ProcessManager:
                     instance.process = None
                 
                 self.instances[instance.id] = instance
-                self._port_allocator.mark_used(instance.port)
+                # Only mark ports as used for instances that could still be running
+                # Stopped instances' ports should be available for reuse
+                if instance.state not in (InstanceState.STOPPED, InstanceState.CRASHED):
+                    self._port_allocator.mark_used(instance.port)
             
             logger.info(f"Loaded {len(self.instances)} instances from state file")
         except Exception as e:
@@ -332,6 +338,134 @@ class ProcessManager:
             self.instances[instance.id] = instance
             self._save_state()
             raise
+    
+    async def spawn_instance_with_factory(
+        self,
+        directory: str | Path,
+        instance_type: str = "opencode",
+        name: str | None = None,
+        config: Dict | None = None,
+        port: int | None = None,
+    ) -> OpenCodeInstance:
+        """Spawn an instance using a factory.
+        
+        This is the preferred method for multi-bot architecture.
+        
+        Args:
+            directory: Working directory for the instance
+            instance_type: Factory type ('opencode', 'quantcode', etc.)
+            name: Human-readable name for the instance
+            config: Type-specific configuration
+            port: Specific port to use (auto-allocated if None)
+            
+        Returns:
+            The created instance
+            
+        Raises:
+            ValueError: If instance type is not registered
+        """
+        directory = Path(directory).expanduser().resolve()
+        
+        if not directory.exists():
+            raise ValueError(f"Directory does not exist: {directory}")
+        
+        # Get factory
+        registry = get_registry()
+        factory = registry.get(instance_type)
+        
+        if factory is None:
+            raise ValueError(f"Unknown instance type: {instance_type}. Available: {registry.list_types()}")
+        
+        # Check if an instance already exists for this directory
+        for inst in self.instances.values():
+            if inst.directory == directory and inst.is_alive:
+                logger.info(f"Instance already running for {directory}")
+                return inst
+        
+        # Allocate port
+        if port is None:
+            port = self._port_allocator.allocate()
+        else:
+            port = self._port_allocator.allocate_specific(port)
+        
+        # Auto-detect project name if not provided
+        if name is None:
+            name = detect_project_name(directory)
+        
+        # Merge config with defaults
+        default_config = registry.get_default_config(instance_type)
+        merged_config = {**default_config, **(config or {})}
+        
+        instance_id = self._generate_instance_id()
+        
+        try:
+            # Create instance via factory
+            instance = await factory.create(
+                instance_id=instance_id,
+                directory=directory,
+                port=port,
+                config=merged_config,
+            )
+            
+            # Override name if provided
+            if name:
+                instance.name = name
+            
+            # Store instance type for later use
+            instance.instance_type = instance_type
+            
+            # Write PID file for orphan tracking
+            if instance.pid:
+                self._pid_manager.write_pid(instance.id, instance.pid)
+            
+            self.instances[instance.id] = instance
+            self._save_state()
+            
+            logger.info(f"Spawned {instance_type} instance {instance.short_id} on port {port}")
+            
+            # Wait for HTTP API to become available
+            if await self._wait_for_startup_with_factory(instance, factory):
+                instance.state = InstanceState.RUNNING
+                instance.last_health_check = datetime.now()
+                logger.info(f"Instance {instance.short_id} is now running")
+            else:
+                instance.state = InstanceState.CRASHED
+                instance.error_message = "HTTP API did not start in time"
+                logger.error(f"Instance {instance.short_id} failed to start")
+            
+            self._save_state()
+            
+            if self.on_instance_change:
+                self.on_instance_change(instance)
+            
+            return instance
+            
+        except Exception as e:
+            logger.error(f"Failed to spawn instance: {e}")
+            self._port_allocator.release(port)
+            raise
+    
+    async def _wait_for_startup_with_factory(
+        self,
+        instance: OpenCodeInstance,
+        factory: InstanceFactory,
+    ) -> bool:
+        """Wait for instance startup using factory health check."""
+        start_time = asyncio.get_event_loop().time()
+        
+        while asyncio.get_event_loop().time() - start_time < STARTUP_TIMEOUT:
+            # Check if process is still running
+            if instance.process and instance.process.returncode is not None:
+                instance.error_message = f"Process exited with code {instance.process.returncode}"
+                return False
+            
+            # Try factory health check
+            if await factory.health_check(instance):
+                return True
+            
+            await asyncio.sleep(STARTUP_POLL_INTERVAL)
+        
+        return False
     
     async def _wait_for_startup(self, instance: OpenCodeInstance) -> bool:
         """Wait for an instance's HTTP API to become available."""

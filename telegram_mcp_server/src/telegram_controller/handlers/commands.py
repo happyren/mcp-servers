@@ -1,15 +1,18 @@
 """Controller-level command handlers.
 
 Handles commands like /open, /list, /switch, /kill, /status, etc.
+Supports multi-bot architecture with different instance types.
 """
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 
 from ..instance import InstanceState, OpenCodeInstance
+from ..instance_factories import get_registry
 
 if TYPE_CHECKING:
     from ..controller import TelegramController
@@ -140,13 +143,39 @@ Or use `/open <path>` to connect the thread to a new project.
         """.strip()
     
     async def _cmd_open(self, args: str, chat_id: int, topic_id: Optional[int] = None) -> str:
-        """Open a project directory, spawning a new OpenCode instance."""
+        """Open a project directory, spawning a new instance.
+        
+        Usage:
+            /open <path>
+            /open <path> --type opencode
+            /open <path> --type quantcode
+        """
         if not args:
-            return "Usage: `/open <path>`\n\nExample: `/open ~/projects/my-app`"
+            types = get_registry().list_types()
+            types_str = ", ".join(types) if types else "opencode"
+            return (
+                "Usage: `/open <path>` [--type TYPE]\n\n"
+                f"Available types: `{types_str}`\n\n"
+                "Example: `/open ~/projects/my-app`\n"
+                "Example: `/open ~/quant/pipeline --type quantcode`"
+            )
+        
+        # Parse arguments: <path> [--type TYPE]
+        instance_type = "opencode"  # Default
+        path_str = args
+        
+        # Check for --type argument
+        type_match = re.search(r'--type\s+(\w+)', args)
+        if type_match:
+            instance_type = type_match.group(1).lower()
+            path_str = re.sub(r'--type\s+\w+', '', args).strip()
         
         # Parse path
-        path_str = args.split()[0]
-        path = Path(path_str).expanduser().resolve()
+        path_parts = path_str.split()
+        if not path_parts:
+            return "Please provide a directory path."
+        
+        path = Path(path_parts[0]).expanduser().resolve()
         
         if not path.exists():
             return f"Directory does not exist: `{path}`"
@@ -154,11 +183,17 @@ Or use `/open <path>` to connect the thread to a new project.
         if not path.is_dir():
             return f"Not a directory: `{path}`"
         
+        # Validate instance type
+        registry = get_registry()
+        if not registry.has_type(instance_type):
+            types_str = ", ".join(registry.list_types())
+            return f"Unknown instance type: `{instance_type}`\n\nAvailable types: `{types_str}`"
+        
         project_name = path.name
-        logger.info(f"_cmd_open: chat_id={chat_id}, topic_id={topic_id}, path={path}")
+        logger.info(f"_cmd_open: chat_id={chat_id}, topic_id={topic_id}, path={path}, type={instance_type}")
         
         # Get or spawn instance
-        instance = await self._get_or_spawn_instance(path)
+        instance = await self._get_or_spawn_instance(path, instance_type=instance_type)
         if isinstance(instance, str):
             return instance
         
@@ -166,42 +201,82 @@ Or use `/open <path>` to connect the thread to a new project.
         self.session_router.set_current_instance(chat_id, instance, topic_id=topic_id)
         
         # If this is a thread, create 1:1 mapping
+        type_label = f" ({instance_type})" if instance_type != "opencode" else ""
         if topic_id is not None:
             self.session_router.set_topic_instance(chat_id, topic_id, instance.id)
             self.session_router._save_state()
             await self.controller._rename_topic(chat_id, topic_id, project_name)
             return (
-                f"📁 Connected thread to *{project_name}*\n\n"
+                f"📁 Connected thread to *{project_name}*{type_label}\n\n"
                 f"Path: `{path}`\n"
                 f"Instance: `{instance.short_id}`\n\n"
-                "Send any message to chat with OpenCode."
+                f"Send any message to chat with {instance_type.title()}."
             )
         
         return (
-            f"📁 Opened *{project_name}*\n\n"
+            f"📁 Opened *{project_name}*{type_label}\n\n"
             f"Path: `{path}`\n"
             f"Instance: `{instance.short_id}` on port {instance.port}\n\n"
-            "Send any message to chat with OpenCode."
+            f"Send any message to chat with {instance_type.title()}."
         )
     
-    async def _get_or_spawn_instance(self, path: Path) -> Union[OpenCodeInstance, str]:
-        """Get existing instance for directory or spawn a new one."""
+    async def _get_or_spawn_instance(
+        self,
+        path: Path,
+        instance_type: str = "opencode",
+    ) -> Union[OpenCodeInstance, str]:
+        """Get existing instance for directory or spawn a new one.
+        
+        Args:
+            path: Directory path
+            instance_type: Type of instance to spawn ('opencode', 'quantcode', etc.)
+            
+        Returns:
+            Instance or error message
+        """
         # Check if instance already exists
         existing = self.process_manager.get_instance_by_directory(path)
         if existing and existing.is_alive:
+            # Check if type matches
+            if existing.instance_type != instance_type:
+                return (
+                    f"Instance already running at `{path}` with type `{existing.instance_type}`.\n\n"
+                    f"Use `/kill {existing.short_id}` to stop it first, then open with new type."
+                )
             return existing
         
-        # Spawn new instance
+        # Check if factory supports this type
+        registry = get_registry()
+        if not registry.has_type(instance_type):
+            return f"Unknown instance type: `{instance_type}`"
+        
+        # Spawn new instance - use factory-based method if available
         try:
-            instance = await self.process_manager.spawn_instance(
-                directory=path,
-                name=path.name,
-                provider_id=self.controller.default_provider,
-                model_id=self.controller.default_model,
-            )
+            # Try factory-based spawn first (preferred for multi-bot)
+            if hasattr(self.process_manager, 'spawn_instance_with_factory'):
+                instance = await self.process_manager.spawn_instance_with_factory(
+                    directory=path,
+                    instance_type=instance_type,
+                    name=path.name,
+                    config={
+                        "provider_id": self.controller.default_provider,
+                        "model_id": self.controller.default_model,
+                    },
+                )
+            else:
+                # Fallback to legacy spawn (only supports opencode)
+                if instance_type != "opencode":
+                    return f"Instance type `{instance_type}` not supported in legacy mode."
+                
+                instance = await self.process_manager.spawn_instance(
+                    directory=path,
+                    name=path.name,
+                    provider_id=self.controller.default_provider,
+                    model_id=self.controller.default_model,
+                )
             
             if instance.state != InstanceState.RUNNING:
-                return f"Failed to start OpenCode instance: {instance.error_message or 'Unknown error'}"
+                return f"Failed to start instance: {instance.error_message or 'Unknown error'}"
             
             return instance
             

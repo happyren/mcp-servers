@@ -78,8 +78,12 @@ class Settings(BaseSettings):
         default=False,
         description="Whether bot commands have been registered with Telegram. Set to true after running set_bot_commands.",
     )
+    custom_commands_file: str = Field(
+        default="",
+        description="Path to a JSON file containing custom bot commands. If set, these commands will be used instead of the default OpenCode commands.",
+    )
     favourite_models: str = Field(
-        default="github-copilot/claude-sonnet-4,github-copilot/gpt-4.1,deepseek/deepseek-reasoner,deepseek/deepseek-chat,anthropic/claude-sonnet-4-20250514,github-copilot/claude-opus-4.5,github-copilot/claude-sonnet-4.5,moonshotai-cn/kimi-k2.5,minimax/minimax-m2.1,zhipuai-coding-plan/GLM-4.7",
+        default="minimax-cn/MiniMax-M2.1,moonshotai-cn/kimi-k2.5,zhipuai/glm-4.7,deepseek/deepseek-reasoner,deepseek/deepseek-chat,opencode/big-pickle,opencode/minimax-m2.1-free,github-copilot/claude-opus-4.5,google/gemini-3-pro-preview",
         description="Comma-separated list of favourite models in 'provider/model' format. These are shown in /models and model picker.",
     )
 

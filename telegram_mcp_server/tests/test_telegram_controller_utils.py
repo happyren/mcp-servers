@@ -224,6 +224,133 @@ class TestPortAllocator:
             port = allocator.allocate()
             assert port in allocator.used_ports
 
+    def test_release_adds_to_released_pool(self):
+        """Test that releasing a port adds it to the released pool."""
+        allocator = PortAllocator(5000, 5100)
+        allocator.used_ports = {5000, 5001}
+        
+        allocator.release(5000)
+        
+        assert 5000 not in allocator.used_ports
+        assert 5000 in allocator.released_ports
+        assert allocator.released_ports_count == 1
+
+    def test_allocate_prefers_released_ports(self):
+        """Test that allocate prioritizes released ports over scanning from start."""
+        allocator = PortAllocator(5000, 5100)
+        
+        # Simulate releasing port 5050
+        allocator.release(5050)
+        
+        # Next allocation should reuse port 5050, not 5000
+        with patch.object(allocator, 'is_port_available', return_value=True):
+            port = allocator.allocate()
+            assert port == 5050
+            assert 5050 in allocator.used_ports
+            assert 5050 not in allocator.released_ports
+
+    def test_allocate_uses_fifo_for_released_ports(self):
+        """Test that released ports are reused in FIFO order."""
+        allocator = PortAllocator(5000, 5100)
+        
+        # Release ports in order
+        allocator.release(5020)
+        allocator.release(5030)
+        allocator.release(5010)
+        
+        # Should get them back in FIFO order
+        with patch.object(allocator, 'is_port_available', return_value=True):
+            assert allocator.allocate() == 5020
+            assert allocator.allocate() == 5030
+            assert allocator.allocate() == 5010
+
+    def test_allocate_skips_unavailable_released_ports(self):
+        """Test that allocate skips released ports that became unavailable."""
+        allocator = PortAllocator(5000, 5100)
+        
+        # Release some ports
+        allocator.release(5050)
+        allocator.release(5060)
+        
+        # First released port is unavailable, second is available
+        with patch.object(allocator, 'is_port_available', side_effect=[False, True]):
+            port = allocator.allocate()
+            assert port == 5060
+
+    def test_allocate_specific_removes_from_released_pool(self):
+        """Test that allocate_specific removes port from released pool."""
+        allocator = PortAllocator(5000, 5100)
+        
+        # Release a port
+        allocator.release(5050)
+        assert 5050 in allocator.released_ports
+        
+        # Allocate it specifically
+        with patch.object(allocator, 'is_port_available', return_value=True):
+            port = allocator.allocate_specific(5050)
+            assert port == 5050
+            assert 5050 not in allocator.released_ports
+
+    def test_mark_used_removes_from_released_pool(self):
+        """Test that mark_used removes port from released pool."""
+        allocator = PortAllocator(5000, 5100)
+        
+        # Release a port
+        allocator.release(5050)
+        assert 5050 in allocator.released_ports
+        
+        # Mark it as used
+        allocator.mark_used(5050)
+        assert 5050 in allocator.used_ports
+        assert 5050 not in allocator.released_ports
+
+    def test_release_outside_range_not_added_to_pool(self):
+        """Test that ports outside the range are not added to released pool."""
+        allocator = PortAllocator(5000, 5100)
+        
+        # Release a port outside the range
+        allocator.release(6000)
+        
+        assert 6000 not in allocator.released_ports
+        assert allocator.released_ports_count == 0
+
+    def test_release_duplicate_not_added_twice(self):
+        """Test that releasing the same port twice doesn't duplicate in pool."""
+        allocator = PortAllocator(5000, 5100)
+        
+        allocator.release(5050)
+        allocator.release(5050)
+        
+        assert allocator.released_ports_count == 1
+        assert allocator.released_ports == [5050]
+
+    def test_port_reuse_prevents_ramp_up(self):
+        """Integration test: verify ports are reused instead of ramping up."""
+        allocator = PortAllocator(5000, 5100)
+        
+        with patch.object(allocator, 'is_port_available', return_value=True):
+            # Allocate 3 ports
+            p1 = allocator.allocate()  # 5000
+            p2 = allocator.allocate()  # 5001
+            p3 = allocator.allocate()  # 5002
+            
+            # Release port 5001
+            allocator.release(p2)
+            
+            # Next allocation should reuse 5001, not get 5003
+            p4 = allocator.allocate()
+            assert p4 == 5001
+            
+            # Now release 5000 and 5002
+            allocator.release(p1)
+            allocator.release(p3)
+            
+            # Next allocations should reuse 5000 and 5002
+            p5 = allocator.allocate()
+            p6 = allocator.allocate()
+            assert p5 == 5000
+            assert p6 == 5002
+
 
 class TestProjectDetector:
     """Tests for project name detection."""

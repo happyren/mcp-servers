@@ -1,0 +1,75 @@
+# Telegram Multi-Bot Controller Configuration
+# Version: 1.0
+#
+# This configuration allows running multiple bot types from a single controller.
+# Supported instance types: opencode, quantcode
+#
+# Environment variables are expanded using ${VAR_NAME} syntax.
+
+# Global controller settings
+controller:
+  state_dir: ~/.local/share/telegram_controller
+  port_range_start: 4097
+  port_range_end: 4200
+  default_provider: deepseek
+  default_model: deepseek-reasoner
+  health_check_interval: 30
+
+# Bot definitions
+bots:
+  # Development bot - spawns OpenCode instances for coding tasks
+  - name: DevBot
+    token: ${TELEGRAM_DEV_BOT_TOKEN}
+    type: opencode
+    chat_id: ${TELEGRAM_DEV_CHAT_ID}
+    config:
+      provider_id: deepseek
+      model_id: deepseek-reasoner
+      no_browser: true
+    
+  # Quant analysis bot - spawns QuantCode instances for news analysis
+  - name: QuantBot
+    token: ${TELEGRAM_QUANT_BOT_TOKEN}
+    type: quantcode
+    chat_id: ${TELEGRAM_QUANT_CHAT_ID}
+    config:
+      # Path to the quantcode project
+      working_dir: ~/quant/info-processing/news-quant-pipeline
+      server_path: python
+      module: packages.news_quant_mcp.server
+      name: QuantCode News Analyzer
+
+# Instance type registry
+# Maps type identifiers to factory classes and default configurations
+instance_types:
+  opencode:
+    factory: telegram_controller.instance_factories.OpenCodeInstanceFactory
+    default_config:
+      provider_id: deepseek
+      model_id: deepseek-reasoner
+      no_browser: true
+  
+  quantcode:
+    factory: telegram_controller.instance_factories.QuantCodeInstanceFactory
+    default_config:
+      server_path: python
+      module: packages.news_quant_mcp.server
+
+# Routing rules
+# Maps specific chats/topics to specific bots
+routing:
+  # Map specific chats to specific bots
+  chat_routing: []
+    # - chat_id: 123456789
+    #   bot_name: DevBot
+    # - chat_id: 987654321
+    #   bot_name: QuantBot
+  
+  # Forum topic routing (for supergroups with topics enabled)
+  forum_routing: []
+    # - chat_id: 111222333
+    #   topic_id: 1
+    #   bot_name: DevBot
+    # - chat_id: 111222333
+    #   topic_id: 2
+    #   bot_name: QuantBot

@@ -15,7 +15,11 @@ DEFAULT_PORT_RANGE_END = 4200
 
 
 class PortAllocator:
-    """Manages port allocation for OpenCode instances."""
+    """Manages port allocation for OpenCode instances.
+    
+    Uses a released ports pool to prefer reusing recently released ports,
+    preventing port numbers from ramping up with each restart.
+    """
     
     def __init__(
         self,
@@ -31,6 +35,8 @@ class PortAllocator:
         self.port_range_start = port_range_start
         self.port_range_end = port_range_end
         self.used_ports: Set[int] = set()
+        # Pool of released ports to prefer for reuse (prevents port ramp-up)
+        self._released_ports: list[int] = []
     
     @staticmethod
     def is_port_available(port: int) -> bool:
@@ -53,8 +59,9 @@ class PortAllocator:
     def allocate(self) -> int:
         """Allocate an unused port.
         
-        Scans the port range and checks both internal tracking and actual
-        system availability.
+        Prioritizes reusing recently released ports to prevent port numbers
+        from ramping up with each restart. Falls back to scanning the port
+        range if no released ports are available.
         
         Returns:
             Allocated port number
@@ -62,6 +69,16 @@ class PortAllocator:
         Raises:
             RuntimeError: If no ports are available
         """
+        # First, try to reuse a released port (prevents port ramp-up)
+        while self._released_ports:
+            port = self._released_ports.pop(0)  # FIFO: oldest released first
+            if port not in self.used_ports and self.is_port_available(port):
+                self.used_ports.add(port)
+                logger.debug(f"Allocated released port {port}")
+                return port
+            # Port was re-used elsewhere or became unavailable, try next
+        
+        # Fallback: scan the port range for first available
         for port in range(self.port_range_start, self.port_range_end):
             if port in self.used_ports:
                 continue
@@ -89,16 +106,27 @@ class PortAllocator:
         if port not in self.used_ports:
             self.used_ports.add(port)
         
+        # Remove from released pool if present (it's now allocated)
+        if port in self._released_ports:
+            self._released_ports.remove(port)
+        
         return port
     
     def release(self, port: int) -> None:
         """Release a port when an instance stops.
         
+        The port is added to the released ports pool for preferential reuse,
+        preventing port numbers from ramping up on restarts.
+        
         Args:
             port: Port to release
         """
         self.used_ports.discard(port)
-        logger.debug(f"Released port {port}")
+        # Add to released pool for preferential reuse (if in our range)
+        if (self.port_range_start <= port < self.port_range_end 
+                and port not in self._released_ports):
+            self._released_ports.append(port)
+        logger.debug(f"Released port {port} (pool size: {len(self._released_ports)})")
     
     def mark_used(self, port: int) -> None:
         """Mark a port as used (e.g., when loading state).
@@ -107,3 +135,16 @@ class PortAllocator:
             port: Port to mark as used
         """
         self.used_ports.add(port)
+        # Remove from released pool if present
+        if port in self._released_ports:
+            self._released_ports.remove(port)
+    
+    @property
+    def released_ports_count(self) -> int:
+        """Get the number of ports in the released pool."""
+        return len(self._released_ports)
+    
+    @property
+    def released_ports(self) -> list[int]:
+        """Get a copy of the released ports pool."""
+        return self._released_ports.copy()
