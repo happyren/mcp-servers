@@ -1,6 +1,7 @@
 """Process manager for OpenCode instances.
 
 Handles spawning, monitoring, and terminating OpenCode subprocess instances.
+Includes PID file management for orphan process cleanup after crashes.
 """
 
 import asyncio
@@ -74,6 +75,10 @@ class ProcessManager:
         self.state_file = self.state_dir / "instances.json"
         self.logs_dir = self.state_dir / "logs"
         self.logs_dir.mkdir(exist_ok=True)
+        
+        # PID files directory for orphan cleanup
+        self.pids_dir = self.state_dir / "pids"
+        self.pids_dir.mkdir(exist_ok=True)
         
         # Auto-detect opencode binary
         self.opencode_path = opencode_path or self._find_opencode()
@@ -278,6 +283,114 @@ class ProcessManager:
         """Release a port when an instance stops."""
         self.used_ports.discard(port)
     
+    def _write_pid_file(self, instance_id: str, pid: int) -> None:
+        """Write PID file for orphan tracking.
+        
+        Args:
+            instance_id: Instance ID
+            pid: Process ID
+        """
+        pid_file = self.pids_dir / f"{instance_id}.pid"
+        try:
+            pid_file.write_text(str(pid), encoding="utf-8")
+            logger.debug(f"Wrote PID file for instance {instance_id[:8]}: {pid}")
+        except Exception as e:
+            logger.error(f"Failed to write PID file for {instance_id[:8]}: {e}")
+    
+    def _remove_pid_file(self, instance_id: str) -> None:
+        """Remove PID file when instance stops.
+        
+        Args:
+            instance_id: Instance ID
+        """
+        pid_file = self.pids_dir / f"{instance_id}.pid"
+        try:
+            if pid_file.exists():
+                pid_file.unlink()
+                logger.debug(f"Removed PID file for instance {instance_id[:8]}")
+        except Exception as e:
+            logger.error(f"Failed to remove PID file for {instance_id[:8]}: {e}")
+    
+    def _is_process_running(self, pid: int) -> bool:
+        """Check if a process is still running.
+        
+        Args:
+            pid: Process ID
+            
+        Returns:
+            True if process exists and is running
+        """
+        try:
+            # Signal 0 checks if process exists without actually sending a signal
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    
+    def _cleanup_orphan_processes(self) -> int:
+        """Clean up orphan processes from previous crashed sessions.
+        
+        Scans the pids directory for leftover PID files, checks if those
+        processes are still running, and terminates them.
+        
+        Returns:
+            Number of orphan processes cleaned up
+        """
+        cleaned = 0
+        
+        if not self.pids_dir.exists():
+            return 0
+        
+        for pid_file in self.pids_dir.glob("*.pid"):
+            instance_id = pid_file.stem
+            
+            try:
+                pid = int(pid_file.read_text(encoding="utf-8").strip())
+            except (ValueError, OSError) as e:
+                logger.warning(f"Invalid PID file {pid_file.name}: {e}")
+                pid_file.unlink(missing_ok=True)
+                continue
+            
+            # Check if we already have this instance tracked with a process
+            existing = self.instances.get(instance_id)
+            if existing and existing.process and existing.pid == pid:
+                # This is a currently managed instance, skip
+                continue
+            
+            # Check if process is still running
+            if self._is_process_running(pid):
+                logger.warning(f"Found orphan process PID {pid} (instance {instance_id[:8]}), terminating...")
+                try:
+                    # Try graceful termination first
+                    os.kill(pid, signal.SIGTERM)
+                    
+                    # Wait briefly for it to exit
+                    for _ in range(10):  # 1 second total
+                        if not self._is_process_running(pid):
+                            break
+                        import time
+                        time.sleep(0.1)
+                    
+                    # Force kill if still running
+                    if self._is_process_running(pid):
+                        logger.warning(f"Orphan PID {pid} did not exit, force killing")
+                        os.kill(pid, signal.SIGKILL)
+                    
+                    logger.info(f"Cleaned up orphan process PID {pid}")
+                    cleaned += 1
+                except OSError as e:
+                    logger.error(f"Failed to kill orphan PID {pid}: {e}")
+            else:
+                logger.debug(f"PID file {pid_file.name} refers to dead process, cleaning up")
+            
+            # Remove the stale PID file
+            pid_file.unlink(missing_ok=True)
+        
+        if cleaned > 0:
+            logger.info(f"Cleaned up {cleaned} orphan process(es)")
+        
+        return cleaned
+    
     def _generate_instance_id(self) -> str:
         """Generate a unique instance ID."""
         return uuid.uuid4().hex[:12]
@@ -322,6 +435,9 @@ class ProcessManager:
         """Start the process manager background tasks."""
         if self._running:
             return
+        
+        # Clean up any orphan processes from previous crashed sessions
+        self._cleanup_orphan_processes()
         
         self._running = True
         self.http_client = httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT)
@@ -454,6 +570,9 @@ class ProcessManager:
             instance.process = process
             instance.pid = process.pid
             
+            # Write PID file for orphan tracking
+            self._write_pid_file(instance.id, process.pid)
+            
             self.instances[instance.id] = instance
             self._save_state()
             
@@ -533,6 +652,7 @@ class ProcessManager:
             instance.pid = None
             instance.process = None
             self._release_port(port)
+            self._remove_pid_file(instance_id)
             self._save_state()
             return True
         
@@ -571,6 +691,7 @@ class ProcessManager:
             instance.pid = None
             instance.process = None
             self._release_port(port)
+            self._remove_pid_file(instance_id)
             self._save_state()
             
             # Wait briefly for port to be released by OS
@@ -603,6 +724,7 @@ class ProcessManager:
             instance.pid = None
             instance.process = None
             self._release_port(port)
+            self._remove_pid_file(instance_id)
             self._save_state()
             return False
     
@@ -682,8 +804,9 @@ class ProcessManager:
         if instance.is_alive:
             await self.stop_instance(instance_id)
         
-        # Release port
+        # Release port and remove PID file
         self._release_port(instance.port)
+        self._remove_pid_file(instance_id)
         
         # Remove from tracking
         del self.instances[instance_id]
@@ -716,6 +839,7 @@ class ProcessManager:
                 instance.state = InstanceState.CRASHED
                 instance.error_message = f"Process exited with code {instance.process.returncode}"
                 instance.pid = None
+                self._remove_pid_file(instance.id)
                 logger.warning(f"Instance {instance.short_id} crashed")
                 
                 if self.auto_restart and instance.restart_count < 3:

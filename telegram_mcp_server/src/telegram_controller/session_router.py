@@ -429,18 +429,20 @@ class SessionRouter:
         # Don't save on every touch - too expensive
     
     def get_chats_for_instance(self, instance_id: str) -> list[int]:
-        """Get all chat IDs connected to an instance.
+        """Get all chat IDs connected to an instance (non-topic mode only).
+        
+        This excludes topic-based contexts - use get_topics_for_instance() for those.
         
         Args:
             instance_id: Instance ID to look up
             
         Returns:
-            List of chat IDs
+            List of chat IDs (only chats without topic routing)
         """
         return [
             context.chat_id
             for context in self.contexts.values()
-            if context.current_instance_id == instance_id
+            if context.current_instance_id == instance_id and context.topic_id is None
         ]
     
     def get_topics_for_instance(self, instance_id: str) -> list[tuple[int, int]]:

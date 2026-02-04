@@ -147,6 +147,10 @@ class TelegramController:
         # Background task for pending checks
         self._pending_check_task: Optional[asyncio.Task] = None
         
+        # Background polling task and update queue
+        self._poll_task: Optional[asyncio.Task] = None
+        self._update_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        
         # Bot info (populated on start)
         self.bot_username: str = ""
         self.bot_has_private_topics: bool = False
@@ -303,6 +307,9 @@ class TelegramController:
         # Start pending notifications check loop
         self._pending_check_task = asyncio.create_task(self._pending_check_loop())
         
+        # Start background polling task
+        self._poll_task = asyncio.create_task(self._background_poll_loop())
+        
         # Setup signal handlers
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -315,6 +322,14 @@ class TelegramController:
         logger.info("Stopping controller...")
         self.running = False
         self._shutdown_event.set()
+        
+        # Cancel background polling task
+        if self._poll_task:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
         
         # Cancel pending check task
         if self._pending_check_task:
@@ -467,8 +482,15 @@ class TelegramController:
                 logger.error(f"Failed to send permission notification to topic: {e}")
         
         # Notify non-topic chats (legacy mode)
+        # Build set of chat_ids that already have topic mappings to avoid double-sending
+        chats_with_topics = {chat_id for chat_id, _ in topic_mappings}
+        
         for chat_id in chat_ids:
             if chat_id in notified:
+                continue
+            # Skip if this chat already has topic-based notifications
+            if chat_id in chats_with_topics:
+                logger.debug(f"Skipping chat {chat_id} - already notified via topic")
                 continue
             
             try:
@@ -545,8 +567,15 @@ class TelegramController:
                 logger.error(f"Failed to send question notification to topic: {e}")
         
         # Notify non-topic chats (legacy mode)
+        # Build set of chat_ids that already have topic mappings to avoid double-sending
+        chats_with_topics = {chat_id for chat_id, _ in topic_mappings}
+        
         for chat_id in chat_ids:
             if chat_id in notified:
+                continue
+            # Skip if this chat already has topic-based notifications
+            if chat_id in chats_with_topics:
+                logger.debug(f"Skipping chat {chat_id} - already notified via topic")
                 continue
             
             try:
@@ -611,21 +640,104 @@ class TelegramController:
             logger.debug(f"Error in immediate pending check: {e}")
 
     async def run(self) -> None:
-        """Main run loop."""
+        """Main run loop.
+        
+        Processing happens by consuming updates from the queue that's
+        populated by the background polling task. This allows us to
+        receive callbacks even while processing long-running messages.
+        """
         await self.start()
         
         try:
             while self.running and not self._shutdown_event.is_set():
                 try:
-                    await self._poll_and_process()
+                    # Wait for an update from the queue (with timeout for shutdown check)
+                    try:
+                        update = await asyncio.wait_for(
+                            self._update_queue.get(),
+                            timeout=1.0
+                        )
+                    except asyncio.TimeoutError:
+                        # No update available, just check shutdown and continue
+                        continue
+                    
+                    # Process the update (don't await blocking operations directly)
+                    asyncio.create_task(self._process_update(update))
+                    
                 except Exception as e:
                     logger.error(f"Error in main loop: {e}")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.1)
         finally:
             await self.stop()
     
+    async def _background_poll_loop(self) -> None:
+        """Background task that polls Telegram and puts updates into a queue.
+        
+        This runs independently of message processing, ensuring we can
+        always receive callback queries (button clicks) even when the
+        main loop is processing a long-running request.
+        """
+        logger.info("Background polling started")
+        
+        while self.running and not self._shutdown_event.is_set():
+            try:
+                updates = await self.telegram.get_updates_with_callbacks(
+                    offset=self.last_offset,
+                    limit=100,
+                    timeout=POLL_TIMEOUT,
+                )
+                
+                if not updates:
+                    continue
+                
+                new_offset = self.last_offset
+                
+                for update in updates:
+                    update_id = update.get("update_id", 0)
+                    if update_id >= new_offset:
+                        new_offset = update_id + 1
+                    
+                    # Put update into queue for processing
+                    await self._update_queue.put(update)
+                
+                if new_offset != self.last_offset:
+                    self.last_offset = new_offset
+                    self._save_offset(new_offset)
+                    
+            except asyncio.CancelledError:
+                logger.info("Background polling cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Polling error: {e}")
+                # Brief delay before retrying on error
+                await asyncio.sleep(1)
+        
+        logger.info("Background polling stopped")
+    
+    async def _process_update(self, update: dict[str, Any]) -> None:
+        """Process a single Telegram update.
+        
+        This is spawned as a task so multiple updates can be processed
+        concurrently (especially important for callbacks while a message
+        is being processed).
+        """
+        try:
+            # Handle message updates
+            if msg := update.get("message"):
+                await self._handle_message(msg)
+            
+            # Handle callback queries (button clicks)
+            if callback := update.get("callback_query"):
+                await self._handle_callback(callback)
+        except Exception as e:
+            logger.error(f"Error processing update: {e}")
+    
     async def _poll_and_process(self) -> None:
-        """Poll Telegram and process messages."""
+        """Poll Telegram and process messages.
+        
+        DEPRECATED: This is kept for compatibility but the main loop
+        now uses _background_poll_loop and _process_update instead.
+        """
         try:
             updates = await self.telegram.get_updates_with_callbacks(
                 offset=self.last_offset,
