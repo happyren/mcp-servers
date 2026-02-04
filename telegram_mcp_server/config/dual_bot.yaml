@@ -1,0 +1,55 @@
+# Telegram Multi-Bot Controller Configuration
+# Dual-bot setup: OpenCode (general) + QuantCode (news analysis)
+#
+# Usage:
+#   telegram-controller --config ~/.config/telegram_controller/dual_bot.yaml
+#
+# This config manages two bots:
+# 1. OpenCode bot - for general coding tasks
+# 2. QuantCode bot - for financial news analysis
+#
+# When you /open with --type quantcode from the OpenCode bot chat,
+# the thread is handed off to the QuantCode bot for subsequent messages.
+
+controller:
+  state_dir: ~/.local/share/telegram_controller
+  port_range_start: 4097
+  port_range_end: 4200
+  default_provider: deepseek
+  default_model: deepseek-reasoner
+  health_check_interval: 30
+
+bots:
+  # Primary bot - OpenCode for general coding
+  - name: opencode
+    token: ${TELEGRAM_BOT_TOKEN}  # From ~/.config/opencode/.telegram_bot_token
+    type: opencode
+    chat_id: 7065048081
+    config:
+      provider_id: deepseek
+      model_id: deepseek-reasoner
+
+  # Secondary bot - QuantCode for news analysis
+  - name: quantcode
+    token: ${TELEGRAM_QUANT_BOT_TOKEN}  # From news-quant-pipeline/.telegram_bot_token
+    type: quantcode
+    chat_id: 7065048081
+    config:
+      working_dir: ~/quant/info-processing/news-quant-pipeline
+      server_path: python
+
+instance_types:
+  opencode:
+    factory: telegram_controller.instance_factories.OpenCodeInstanceFactory
+    default_config:
+      provider_id: deepseek
+      model_id: deepseek-reasoner
+
+  quantcode:
+    factory: telegram_controller.instance_factories.QuantCodeInstanceFactory
+    default_config:
+      working_dir: ~/quant/info-processing/news-quant-pipeline
+
+routing:
+  chat_routing: []
+  forum_routing: []

@@ -200,6 +200,9 @@ Or use `/open <path>` to connect the thread to a new project.
         # Map to current context
         self.session_router.set_current_instance(chat_id, instance, topic_id=topic_id)
         
+        # Handle multi-bot handoff if needed
+        handoff_msg = await self._handle_bot_handoff(chat_id, topic_id, instance_type)
+        
         # If this is a thread, create 1:1 mapping
         type_label = f" ({instance_type})" if instance_type != "opencode" else ""
         if topic_id is not None:
@@ -210,6 +213,7 @@ Or use `/open <path>` to connect the thread to a new project.
                 f"📁 Connected thread to *{project_name}*{type_label}\n\n"
                 f"Path: `{path}`\n"
                 f"Instance: `{instance.short_id}`\n\n"
+                f"{handoff_msg}"
                 f"Send any message to chat with {instance_type.title()}."
             )
         
@@ -217,6 +221,7 @@ Or use `/open <path>` to connect the thread to a new project.
             f"📁 Opened *{project_name}*{type_label}\n\n"
             f"Path: `{path}`\n"
             f"Instance: `{instance.short_id}` on port {instance.port}\n\n"
+            f"{handoff_msg}"
             f"Send any message to chat with {instance_type.title()}."
         )
     
@@ -282,6 +287,60 @@ Or use `/open <path>` to connect the thread to a new project.
             
         except Exception as e:
             return f"Failed to spawn instance: {str(e)[:200]}"
+    
+    async def _handle_bot_handoff(
+        self,
+        chat_id: int,
+        topic_id: Optional[int],
+        instance_type: str,
+    ) -> str:
+        """Handle bot handoff when spawning a different instance type.
+        
+        In multi-bot mode, assigns the thread to the appropriate bot
+        and sends a notification if the bot changes.
+        
+        Args:
+            chat_id: Telegram chat ID
+            topic_id: Topic ID if in forum
+            instance_type: Type of instance being spawned
+            
+        Returns:
+            Message string to include in response (or empty string)
+        """
+        # Check if multi-bot mode is active
+        if not hasattr(self.controller, '_use_multi_bot') or not self.controller._use_multi_bot:
+            return ""
+        
+        if not self.controller.multi_bot_manager:
+            return ""
+        
+        manager = self.controller.multi_bot_manager
+        
+        # Get current bot for this thread
+        current_bot = manager.get_bot_for_thread(chat_id, topic_id)
+        current_bot_name = current_bot.config.name if current_bot else None
+        
+        # Assign thread to the bot for this instance type
+        new_bot_name = manager.assign_thread_to_type(chat_id, topic_id, instance_type)
+        
+        if not new_bot_name:
+            return ""
+        
+        # Check if bot changed
+        if current_bot_name and current_bot_name != new_bot_name:
+            new_bot = manager.get_bot_by_name(new_bot_name)
+            if new_bot:
+                # Notify about handoff
+                await manager.send_handoff_notification(
+                    chat_id=chat_id,
+                    topic_id=topic_id,
+                    from_bot=current_bot_name,
+                    to_bot=new_bot_name,
+                    instance_type=instance_type,
+                )
+                return f"Bot handoff: Responses will come from @{new_bot.username}\n\n"
+        
+        return ""
     
     async def _cmd_list(
         self, args: str, chat_id: int, topic_id: Optional[int] = None

@@ -38,6 +38,7 @@ from .handlers import ControllerCommands, CallbackHandler, MessageHandler
 from .handlers.commands import CommandResponse
 from .instance_factories import get_registry
 from .config_schema import MultiBotConfig, load_config, get_default_config
+from .multi_bot_manager import MultiBotManager
 
 # Configure logging
 logging.basicConfig(
@@ -177,12 +178,17 @@ class TelegramController:
         # Background polling task and update queue
         self._poll_task: Optional[asyncio.Task] = None
         self._update_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._multi_bot_update_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
         
         # Bot info (populated on start)
         self.bot_username: str = ""
         self.bot_has_private_topics: bool = False
         
         logger.info(f"Controller initialized with state dir: {self.state_dir}")
+        
+        # Multi-bot manager (initialized in start() if config has multiple bots)
+        self.multi_bot_manager: Optional[MultiBotManager] = None
+        self._use_multi_bot = False
     
     def _load_favourite_models(self) -> list[Tuple[str, str]]:
         """Load favourite models from settings or use defaults."""
@@ -297,6 +303,22 @@ class TelegramController:
         self.running = True
         self._shutdown_event.clear()
         
+        # Initialize multi-bot manager if config has multiple bots
+        if self.multi_bot_config and len(self.multi_bot_config.bots) > 1:
+            try:
+                self.multi_bot_manager = MultiBotManager(
+                    config=self.multi_bot_config,
+                    api_base_url=self.settings.api_base_url,
+                )
+                await self.multi_bot_manager.initialize()
+                self._use_multi_bot = True
+                logger.info(f"Multi-bot manager initialized with {len(self.multi_bot_manager.bots)} bots")
+            except Exception as e:
+                logger.error(f"Failed to initialize multi-bot manager: {e}")
+                logger.info("Falling back to single-bot mode")
+                self.multi_bot_manager = None
+                self._use_multi_bot = False
+        
         # Check bot info and capabilities
         try:
             bot_info = await self.telegram.get_me()
@@ -320,7 +342,13 @@ class TelegramController:
         await self._notification_manager.start()
         
         # Start background polling task
-        self._poll_task = asyncio.create_task(self._background_poll_loop())
+        if self._use_multi_bot and self.multi_bot_manager:
+            # Use multi-bot polling - get queue from manager
+            self._multi_bot_update_queue = await self.multi_bot_manager.start_polling()
+            self._poll_task = asyncio.create_task(self._multi_bot_poll_loop())
+        else:
+            # Use single-bot polling
+            self._poll_task = asyncio.create_task(self._background_poll_loop())
         
         # Setup signal handlers
         loop = asyncio.get_running_loop()
@@ -342,6 +370,11 @@ class TelegramController:
                 await self._poll_task
             except asyncio.CancelledError:
                 pass
+        
+        # Stop multi-bot manager if active
+        if self.multi_bot_manager:
+            await self.multi_bot_manager.close()
+            self.multi_bot_manager = None
         
         # Stop notification manager
         await self._notification_manager.stop()
@@ -430,6 +463,63 @@ class TelegramController:
         
         logger.info("Background polling stopped")
     
+    async def _multi_bot_poll_loop(self) -> None:
+        """Process updates from multi-bot manager.
+        
+        In multi-bot mode, the MultiBotManager handles polling for all bots
+        and puts (bot_name, update) tuples into the queue. This loop processes
+        those updates and routes them appropriately.
+        """
+        logger.info("Multi-bot poll loop started")
+        
+        while self.running and not self._shutdown_event.is_set():
+            try:
+                try:
+                    # Queue contains (bot_name, update) tuples
+                    item = await asyncio.wait_for(
+                        self._multi_bot_update_queue.get(),
+                        timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                
+                bot_name, update = item
+                asyncio.create_task(self._process_multi_bot_update(bot_name, update))
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in multi-bot poll loop: {e}")
+                await asyncio.sleep(0.1)
+        
+        logger.info("Multi-bot poll loop stopped")
+    
+    async def _process_multi_bot_update(self, bot_name: str, update: dict[str, Any]) -> None:
+        """Process an update from a specific bot.
+        
+        Args:
+            bot_name: Name of the bot that received the update
+            update: Telegram update object
+        """
+        try:
+            if msg := update.get("message"):
+                await self._handle_message_from_bot(msg, bot_name)
+            
+            if callback := update.get("callback_query"):
+                # For callbacks, determine which bot should handle it
+                await self._callback_handler.handle(callback)
+        except Exception as e:
+            logger.error(f"Error processing update from bot '{bot_name}': {e}")
+    
+    async def _handle_message_from_bot(self, msg: dict[str, Any], bot_name: str) -> None:
+        """Handle a message from a specific bot in multi-bot mode.
+        
+        This is similar to _handle_message but tracks which bot received it.
+        """
+        # For now, delegate to the standard handler
+        # The bot routing is handled when sending responses
+        await self._handle_message(msg)
+    
     async def _process_update(self, update: dict[str, Any]) -> None:
         """Process a single Telegram update."""
         try:
@@ -512,17 +602,19 @@ class TelegramController:
         topic_id: Optional[int] = None,
     ) -> None:
         """Send a response to a chat or topic."""
+        client = self._get_telegram_client(chat_id, topic_id)
+        
         if isinstance(response, CommandResponse):
             if response.keyboard:
                 if topic_id is not None:
-                    await self.telegram.send_message_with_keyboard_to_topic(
+                    await client.send_message_with_keyboard_to_topic(
                         chat_id=str(chat_id),
                         message_thread_id=topic_id,
                         text=response.text,
                         inline_keyboard=response.keyboard,
                     )
                 else:
-                    await self.telegram.send_message_with_keyboard(
+                    await client.send_message_with_keyboard(
                         chat_id=str(chat_id),
                         text=response.text,
                         inline_keyboard=response.keyboard,
@@ -532,6 +624,20 @@ class TelegramController:
         else:
             await self._send_text(chat_id, str(response), topic_id)
     
+    def _get_telegram_client(
+        self,
+        chat_id: int,
+        topic_id: Optional[int] = None,
+    ) -> TelegramClient:
+        """Get the appropriate Telegram client for a chat/topic.
+        
+        In multi-bot mode, returns the bot assigned to this thread.
+        In single-bot mode, returns the default telegram client.
+        """
+        if self._use_multi_bot and self.multi_bot_manager:
+            return self.multi_bot_manager.get_client_for_thread(chat_id, topic_id)
+        return self.telegram
+    
     async def _send_text(
         self,
         chat_id: int,
@@ -540,14 +646,15 @@ class TelegramController:
     ) -> None:
         """Send a text message to a chat or topic."""
         try:
+            client = self._get_telegram_client(chat_id, topic_id)
             if topic_id is not None:
-                await self.telegram.send_message_to_topic(
+                await client.send_message_to_topic(
                     chat_id=str(chat_id),
                     message_thread_id=topic_id,
                     text=text,
                 )
             else:
-                await self.telegram.send_message(
+                await client.send_message(
                     chat_id=str(chat_id),
                     text=text,
                 )
