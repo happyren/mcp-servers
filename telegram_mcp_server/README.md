@@ -333,6 +333,76 @@ Messages are stored in `~/.local/share/telegram_mcp_server/message_queue.json` a
 
 ---
 
+## Telegram Controller (Multi-Instance Management)
+
+The **Telegram Controller** is a standalone daemon that enables **multi-instance OpenCode management** via Telegram. It allows you to:
+
+- **Run multiple OpenCode instances** for different projects simultaneously
+- **Map each reply thread** to a different project instance
+- **Spawn instances on-demand** with `/open <path>` command
+- **Switch between instances** with `/list` and `/switch`
+- **Receive notifications** for pending permissions and questions
+- **Support forum topics** in Telegram supergroups
+
+### Installation
+
+The controller is included in the package. After installing the Telegram MCP Server, you can run:
+
+```bash
+# Start the controller daemon
+telegram-controller
+
+# Start with custom state directory
+telegram-controller --state-dir ~/.telegram-controller
+
+# Start with specific default model
+telegram-controller --provider deepseek --model deepseek-reasoner
+```
+
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `TELEGRAM_BOT_TOKEN` | Yes | - | Bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | Yes | - | Default chat ID for notifications |
+| `TELEGRAM_PROVIDER` | No | `github-copilot` | Default AI provider for new instances |
+| `TELEGRAM_MODEL` | No | `claude-sonnet-4` | Default AI model for new instances |
+| `TELEGRAM_FAVOURITE_MODELS` | No | See below | Comma-separated list of favourite models |
+
+### Controller Commands
+
+| Command | Description |
+|---------|-------------|
+| `/open <path>` | Open project directory in current thread |
+| `/list` | List all running instances (tap to switch) |
+| `/switch [id]` | Switch to different instance |
+| `/current` | Show current instance details |
+| `/close` | Stop current instance |
+| `/kill <id>` | Stop specific instance |
+| `/restart <id>` | Restart an instance |
+| `/status` | Instance status overview |
+| `/threads` | List thread-instance mappings |
+| `/help` | Show controller help |
+
+### Usage Example
+
+1. **Start the controller**: `telegram-controller`
+2. **In Telegram**, reply to any message (creates a thread)
+3. **Send `/open ~/projects/my-app`** - spawns OpenCode instance for that project
+4. **Send any message** - forwarded to that instance
+5. **Create another thread**, `/open ~/projects/another` - second instance
+
+Each reply thread can be connected to a different project!
+
+### State Management
+
+The controller stores state in `~/.local/share/telegram_controller/`:
+- `instances.json` - Running instance metadata
+- `session_routes.json` - Thread-instance mappings
+- `polling_offset.json` - Telegram polling offset
+
+---
+
 ## Docker Deployment
 
 ### Build and Run
@@ -415,9 +485,15 @@ telegram_mcp_server/
 │   ├── telegram_polling_service/
 │   │   ├── __init__.py
 │   │   └── polling_service.py # Background message polling
-│   └── telegram_bridge/
+│   ├── telegram_bridge/
+│   │   ├── __init__.py
+│   │   └── bridge_service.py  # OpenCode bridge service
+│   └── telegram_controller/
 │       ├── __init__.py
-│       └── bridge_service.py  # OpenCode bridge service
+│       ├── controller.py      # Main controller daemon
+│       ├── instance.py        # OpenCode instance representation
+│       ├── process_manager.py # Instance lifecycle management
+│       └── session_router.py  # Thread-instance routing
 ├── tests/
 │   ├── conftest.py
 │   └── test_validation.py
