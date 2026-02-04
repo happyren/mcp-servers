@@ -45,6 +45,7 @@ dev = [
 telegram-mcp-server = "telegram_mcp_server:main"
 telegram-mcp-polling = "telegram_polling_service:main"
 telegram-opencode-bridge = "telegram_bridge:main"
+telegram-controller = "telegram_controller:main"
 
 [project.urls]
 Homepage = "https://github.com/your-org/telegram-mcp-server"
@@ -52,7 +53,7 @@ Repository = "https://github.com/your-org/telegram-mcp-server"
 Issues = "https://github.com/your-org/telegram-mcp-server/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/telegram_mcp_server", "src/telegram_polling_service", "src/telegram_bridge"]
+packages = ["src/telegram_mcp_server", "src/telegram_polling_service", "src/telegram_bridge", "src/telegram_controller"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

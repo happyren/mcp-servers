@@ -732,3 +732,307 @@ class TelegramClient:
 
         result = await self._request_with_retry("getUpdates", params)
         return result if isinstance(result, list) else []
+    
+    # ==================== Forum Topics API ====================
+    
+    async def create_forum_topic(
+        self,
+        chat_id: str | int,
+        name: str,
+        icon_color: int | None = None,
+        icon_custom_emoji_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a topic in a forum supergroup chat.
+        
+        Args:
+            chat_id: The supergroup chat ID
+            name: Topic name (1-128 characters)
+            icon_color: RGB color (must be one of: 0x6FB9F0, 0xFFD67E, 0xCB86DB, 
+                        0x8EEE98, 0xFF93B2, 0xFB6F5F)
+            icon_custom_emoji_id: Custom emoji identifier for topic icon
+            
+        Returns:
+            ForumTopic object with message_thread_id
+        """
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "name": name[:128],
+        }
+        if icon_color is not None:
+            params["icon_color"] = icon_color
+        if icon_custom_emoji_id is not None:
+            params["icon_custom_emoji_id"] = icon_custom_emoji_id
+        
+        return await self._request_with_retry("createForumTopic", params, is_read=False)
+    
+    async def edit_forum_topic(
+        self,
+        chat_id: str | int,
+        message_thread_id: int,
+        name: str | None = None,
+        icon_custom_emoji_id: str | None = None,
+    ) -> bool:
+        """Edit name and/or icon of a forum topic.
+        
+        Args:
+            chat_id: The supergroup chat ID
+            message_thread_id: The topic ID
+            name: New topic name (optional)
+            icon_custom_emoji_id: New custom emoji ID (optional)
+            
+        Returns:
+            True on success
+        """
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_thread_id": message_thread_id,
+        }
+        if name is not None:
+            params["name"] = name[:128]
+        if icon_custom_emoji_id is not None:
+            params["icon_custom_emoji_id"] = icon_custom_emoji_id
+        
+        await self._request_with_retry("editForumTopic", params, is_read=False)
+        return True
+    
+    async def close_forum_topic(
+        self,
+        chat_id: str | int,
+        message_thread_id: int,
+    ) -> bool:
+        """Close an open topic in a forum supergroup.
+        
+        Args:
+            chat_id: The supergroup chat ID
+            message_thread_id: The topic ID
+            
+        Returns:
+            True on success
+        """
+        await self._request_with_retry(
+            "closeForumTopic",
+            {"chat_id": chat_id, "message_thread_id": message_thread_id},
+            is_read=False,
+        )
+        return True
+    
+    async def reopen_forum_topic(
+        self,
+        chat_id: str | int,
+        message_thread_id: int,
+    ) -> bool:
+        """Reopen a closed topic in a forum supergroup.
+        
+        Args:
+            chat_id: The supergroup chat ID
+            message_thread_id: The topic ID
+            
+        Returns:
+            True on success
+        """
+        await self._request_with_retry(
+            "reopenForumTopic",
+            {"chat_id": chat_id, "message_thread_id": message_thread_id},
+            is_read=False,
+        )
+        return True
+    
+    async def delete_forum_topic(
+        self,
+        chat_id: str | int,
+        message_thread_id: int,
+    ) -> bool:
+        """Delete a forum topic along with all its messages.
+        
+        Args:
+            chat_id: The supergroup chat ID
+            message_thread_id: The topic ID
+            
+        Returns:
+            True on success
+        """
+        await self._request_with_retry(
+            "deleteForumTopic",
+            {"chat_id": chat_id, "message_thread_id": message_thread_id},
+            is_read=False,
+        )
+        return True
+    
+    async def hide_general_forum_topic(
+        self,
+        chat_id: str | int,
+    ) -> bool:
+        """Hide the 'General' topic in a forum supergroup.
+        
+        The bot must be an administrator with can_manage_topics rights.
+        
+        Args:
+            chat_id: The supergroup chat ID
+            
+        Returns:
+            True on success
+        """
+        await self._request_with_retry(
+            "hideGeneralForumTopic",
+            {"chat_id": chat_id},
+            is_read=False,
+        )
+        return True
+    
+    async def unhide_general_forum_topic(
+        self,
+        chat_id: str | int,
+    ) -> bool:
+        """Unhide the 'General' topic in a forum supergroup.
+        
+        The bot must be an administrator with can_manage_topics rights.
+        
+        Args:
+            chat_id: The supergroup chat ID
+            
+        Returns:
+            True on success
+        """
+        await self._request_with_retry(
+            "unhideGeneralForumTopic",
+            {"chat_id": chat_id},
+            is_read=False,
+        )
+        return True
+    
+    async def close_general_forum_topic(
+        self,
+        chat_id: str | int,
+    ) -> bool:
+        """Close the 'General' topic in a forum supergroup.
+        
+        The bot must be an administrator with can_manage_topics rights.
+        
+        Args:
+            chat_id: The supergroup chat ID
+            
+        Returns:
+            True on success
+        """
+        await self._request_with_retry(
+            "closeGeneralForumTopic",
+            {"chat_id": chat_id},
+            is_read=False,
+        )
+        return True
+    
+    async def reopen_general_forum_topic(
+        self,
+        chat_id: str | int,
+    ) -> bool:
+        """Reopen the closed 'General' topic in a forum supergroup.
+        
+        The bot must be an administrator with can_manage_topics rights.
+        
+        Args:
+            chat_id: The supergroup chat ID
+            
+        Returns:
+            True on success
+        """
+        await self._request_with_retry(
+            "reopenGeneralForumTopic",
+            {"chat_id": chat_id},
+            is_read=False,
+        )
+        return True
+
+    async def send_message_to_topic(
+        self,
+        chat_id: str | int,
+        message_thread_id: int,
+        text: str,
+        parse_mode: str | None = "Markdown",
+        disable_notification: bool = False,
+    ) -> dict[str, Any]:
+        """Send a text message to a specific topic in a forum.
+        
+        Args:
+            chat_id: The supergroup chat ID
+            message_thread_id: The topic ID
+            text: The message text
+            parse_mode: Parse mode (Markdown, HTML, or None)
+            disable_notification: Send silently
+            
+        Returns:
+            The sent message information
+        """
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_thread_id": message_thread_id,
+            "text": text,
+            "disable_notification": disable_notification,
+        }
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+        
+        return await self._request_with_retry("sendMessage", params, is_read=False)
+    
+    async def send_message_with_keyboard_to_topic(
+        self,
+        chat_id: str | int,
+        message_thread_id: int,
+        text: str,
+        inline_keyboard: list[list[dict[str, str]]],
+        parse_mode: str | None = "Markdown",
+    ) -> dict[str, Any]:
+        """Send a message with an inline keyboard to a topic.
+        
+        Args:
+            chat_id: The supergroup chat ID
+            message_thread_id: The topic ID
+            text: The message text
+            inline_keyboard: List of button rows
+            parse_mode: Parse mode
+            
+        Returns:
+            The sent message information
+        """
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_thread_id": message_thread_id,
+            "text": text,
+            "reply_markup": {"inline_keyboard": inline_keyboard},
+        }
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+        
+        return await self._request_with_retry("sendMessage", params, is_read=False)
+    
+    async def set_typing_in_topic(
+        self,
+        chat_id: str | int,
+        message_thread_id: int,
+    ) -> bool:
+        """Send a typing indicator to a specific topic.
+        
+        Args:
+            chat_id: The supergroup chat ID
+            message_thread_id: The topic ID
+            
+        Returns:
+            True if successful
+        """
+        await self._request_with_retry(
+            "sendChatAction",
+            {
+                "chat_id": chat_id,
+                "message_thread_id": message_thread_id,
+                "action": "typing",
+            },
+        )
+        return True
+    
+    async def get_forum_topic_icon_stickers(self) -> list[dict[str, Any]]:
+        """Get custom emoji stickers available for forum topic icons.
+        
+        Returns:
+            List of Sticker objects usable as forum topic icons
+        """
+        result = await self._request_with_retry("getForumTopicIconStickers")
+        return result if isinstance(result, list) else []

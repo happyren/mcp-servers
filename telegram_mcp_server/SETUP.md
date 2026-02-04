@@ -304,3 +304,36 @@ With `--enable-polling` and `--enable-bridge`, the MCP server runs everything in
 3. **MCP Tools**: Provide direct Telegram functionality to the AI agent
 
 No separate processes or plugins needed!
+
+---
+
+## Advanced: Telegram Controller (Multi-Instance Management)
+
+For advanced workflows requiring **multiple OpenCode instances** (e.g., different projects per reply thread), use the **Telegram Controller**:
+
+```bash
+# Install (already included in package)
+pip install -e .
+
+# Start the controller daemon
+telegram-controller
+```
+
+### Key Differences
+
+| Feature | MCP Server | Controller |
+|---------|------------|------------|
+| **Instance Management** | Single OpenCode instance | Multiple instances (one per thread/project) |
+| **Thread Mapping** | Not applicable | Maps each reply thread to a project |
+| **Commands** | Standard MCP tools | Controller commands (`/open`, `/list`, `/switch`) |
+| **Setup** | Configure in OpenCode config | Run as standalone daemon |
+| **Use Case** | Simple bot integration | Team/project workflows with forum topics |
+
+### Migration
+
+To switch from MCP server to controller:
+1. Stop any running `telegram-mcp-server` processes
+2. Start `telegram-controller` with same credentials
+3. Use `/open <path>` in reply threads to attach projects
+
+The controller provides a more flexible architecture for complex workflows while maintaining all Telegram integration features.

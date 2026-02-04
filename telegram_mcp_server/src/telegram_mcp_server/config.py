@@ -33,7 +33,7 @@ class Settings(BaseSettings):
         description="Whether bot commands have been registered with Telegram. Set to true after running set_bot_commands.",
     )
     favourite_models: str = Field(
-        default="deepseek/deepseek-reasoner,deepseek/deepseek-chat",
+        default="github-copilot/claude-sonnet-4,github-copilot/gpt-4.1,deepseek/deepseek-reasoner,deepseek/deepseek-chat,anthropic/claude-sonnet-4-20250514,github-copilot/claude-opus-4.5,github-copilot/claude-sonnet-4.5,moonshotai-cn/kimi-k2.5,minimax/minimax-m2.1,zhipuai-coding-plan/GLM-4.7",
         description="Comma-separated list of favourite models in 'provider/model' format. These are shown in /models and model picker.",
     )
 
