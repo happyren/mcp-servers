@@ -46,8 +46,8 @@ logger = logging.getLogger("telegram_controller")
 POLL_TIMEOUT = 30  # Long polling timeout in seconds
 TYPING_INTERVAL = 4.0  # Send typing indicator every N seconds
 PENDING_CHECK_INTERVAL = 10.0  # Check for pending permissions/questions every N seconds
-DEFAULT_MODEL_PROVIDER = "github-copilot"
-DEFAULT_MODEL_ID = "claude-sonnet-4"
+DEFAULT_MODEL_PROVIDER = "deepseek"
+DEFAULT_MODEL_ID = "deepseek-reasoner"
 
 # Default favourite models for model picker
 DEFAULT_FAVOURITE_MODELS = [

@@ -970,20 +970,28 @@ class CommandHandler:
                 model_id = args
                 provider_id = None
                 
-                if model_id.lower().startswith("gpt") or model_id.startswith("o1") or model_id.startswith("o3"):
-                    provider_id = "openai"
-                elif model_id.lower().startswith("claude"):
-                    provider_id = "anthropic"
-                elif model_id.lower().startswith("deepseek"):
-                    provider_id = "deepseek"
-                elif model_id.lower().startswith("gemini"):
-                    provider_id = "google"
-                elif model_id.lower().startswith("minimax"):
-                    provider_id = "minimax"
-                elif model_id.lower().startswith("kimi"):
-                    provider_id = "moonshotai-cn"
-                elif model_id.lower().startswith("glm"):
-                    provider_id = "zhipuai-coding-plan"
+                # First, check favourite models for exact match
+                for fav_provider, fav_model in self._favourite_models:
+                    if fav_model.lower() == model_id.lower():
+                        provider_id = fav_provider
+                        break
+                
+                # If not found in favourites, try pattern matching
+                if not provider_id:
+                    if model_id.lower().startswith("gpt") or model_id.startswith("o1") or model_id.startswith("o3"):
+                        provider_id = "openai"
+                    elif model_id.lower().startswith("claude"):
+                        provider_id = "anthropic"
+                    elif model_id.lower().startswith("deepseek"):
+                        provider_id = "deepseek"
+                    elif model_id.lower().startswith("gemini"):
+                        provider_id = "google"
+                    elif model_id.lower().startswith("minimax"):
+                        provider_id = "minimax"
+                    elif model_id.lower().startswith("kimi"):
+                        provider_id = "moonshotai-cn"
+                    elif model_id.lower().startswith("glm"):
+                        provider_id = "zhipuai-coding-plan"
                 
                 if not provider_id:
                     return f"❌ Could not infer provider for `{model_id}`\n\nUse format: `/models <provider>/<model>`"

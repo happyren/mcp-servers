@@ -365,8 +365,8 @@ telegram-controller --provider deepseek --model deepseek-reasoner
 |----------|----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Yes | - | Bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | Yes | - | Default chat ID for notifications |
-| `TELEGRAM_PROVIDER` | No | `github-copilot` | Default AI provider for new instances |
-| `TELEGRAM_MODEL` | No | `claude-sonnet-4` | Default AI model for new instances |
+| `TELEGRAM_PROVIDER` | No | `deepseek` | Default AI provider for new instances |
+| `TELEGRAM_MODEL` | No | `deepseek-reasoner` | Default AI model for new instances |
 | `TELEGRAM_FAVOURITE_MODELS` | No | See below | Comma-separated list of favourite models |
 
 ### Controller Commands

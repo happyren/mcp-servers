@@ -55,8 +55,8 @@ class OpenCodeInstance:
     health_check_failures: int = 0
     
     # Model configuration for this instance
-    provider_id: str = "github-copilot"
-    model_id: str = "claude-sonnet-4"
+    provider_id: str = "deepseek"
+    model_id: str = "deepseek-reasoner"
     
     # Human-readable name/label for this instance
     name: Optional[str] = None
@@ -145,8 +145,8 @@ class OpenCodeInstance:
             started_at=started_at,
             last_health_check=last_health_check,
             health_check_failures=data.get("health_check_failures", 0),
-            provider_id=data.get("provider_id", "github-copilot"),
-            model_id=data.get("model_id", "claude-sonnet-4"),
+            provider_id=data.get("provider_id", "deepseek"),
+            model_id=data.get("model_id", "deepseek-reasoner"),
             name=data.get("name"),
             session_id=data.get("session_id"),
             restart_count=data.get("restart_count", 0),

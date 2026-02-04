@@ -360,8 +360,8 @@ class ProcessManager:
         self,
         directory: str | Path,
         name: str | None = None,
-        provider_id: str = "github-copilot",
-        model_id: str = "claude-sonnet-4",
+        provider_id: str = "deepseek",
+        model_id: str = "deepseek-reasoner",
         port: int | None = None,
     ) -> OpenCodeInstance:
         """Spawn a new OpenCode instance.
