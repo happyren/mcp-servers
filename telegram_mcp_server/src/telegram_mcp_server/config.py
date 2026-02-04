@@ -1,8 +1,54 @@
 """Configuration management for Telegram MCP Server."""
 
 import os
+from pathlib import Path
 from pydantic_settings import BaseSettings
 from pydantic import Field
+
+
+def _load_env_from_files():
+    """Load environment variables from credential files if not already set.
+    
+    This provides fallback loading for when Opencode's {file:...} syntax
+    doesn't resolve correctly before the module imports.
+    """
+    # Try to load bot token from credential file
+    if not os.getenv('TELEGRAM_BOT_TOKEN'):
+        token_files = [
+            Path.home() / '.config' / 'opencode' / '.telegram_bot_token',
+            Path.home() / '.telegram_bot_token',
+            Path('/Users/k/quant/info-processing/news-quant-pipeline/.telegram_bot_token'),
+        ]
+        for token_file in token_files:
+            if token_file.exists():
+                try:
+                    token = token_file.read_text().strip()
+                    if token:
+                        os.environ['TELEGRAM_BOT_TOKEN'] = token
+                        break
+                except Exception:
+                    pass
+    
+    # Try to load chat ID from credential file
+    if not os.getenv('TELEGRAM_CHAT_ID'):
+        chat_files = [
+            Path.home() / '.config' / 'opencode' / '.telegram_chat_id',
+            Path.home() / '.telegram_chat_id',
+            Path('/Users/k/quant/info-processing/news-quant-pipeline/.telegram_chat_id'),
+        ]
+        for chat_file in chat_files:
+            if chat_file.exists():
+                try:
+                    chat_id = chat_file.read_text().strip()
+                    if chat_id:
+                        os.environ['TELEGRAM_CHAT_ID'] = chat_id
+                        break
+                except Exception:
+                    pass
+
+
+# Load environment variables from files before Settings initialization
+_load_env_from_files()
 
 
 class Settings(BaseSettings):
@@ -53,6 +99,7 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         env_prefix = "TELEGRAM_"
+        extra = "ignore"  # Ignore extra fields from .env files that aren't TELEGRAM_* prefixed
         
     def __init__(self, **kwargs):
         # Load .env from the project root if not specified

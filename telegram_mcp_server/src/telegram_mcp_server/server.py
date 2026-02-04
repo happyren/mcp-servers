@@ -42,7 +42,20 @@ def get_queue_file_path() -> Path:
     return queue_dir / "message_inbox.json"
 
 
-QUEUE_FILE_PATH = get_queue_file_path()
+# Don't initialize at module import time - will be initialized in main()
+QUEUE_FILE_PATH: Path | None = None
+
+
+def _ensure_queue_path_initialized() -> Path:
+    """Ensure QUEUE_FILE_PATH is initialized (lazy initialization)."""
+    global QUEUE_FILE_PATH
+    if QUEUE_FILE_PATH is None:
+        try:
+            QUEUE_FILE_PATH = get_queue_file_path()
+        except Exception as e:
+            logger.warning(f"Failed to initialize queue path: {e}. Using default.")
+            QUEUE_FILE_PATH = Path.home() / ".local" / "share" / "telegram_mcp_server" / "message_inbox.json"
+    return QUEUE_FILE_PATH
 
 
 def get_client() -> TelegramClient:
@@ -74,7 +87,7 @@ def get_queued_messages(clear_after_read: bool = False) -> list[dict[str, Any]]:
     Returns:
         List of queued messages as dictionaries.
     """
-    queue_path = get_queue_file_path()
+    queue_path = _ensure_queue_path_initialized()
 
     if not queue_path.exists():
         return []
@@ -961,7 +974,7 @@ async def telegram_get_queued_messages(
             "telegram_get_queued_messages",
             e,
             category=ErrorCategory.GENERAL,
-            user_message=f"Error reading queue file at {get_queue_file_path()}",
+            user_message=f"Error reading queue file at {_ensure_queue_path_initialized()}",
         )
 
 
@@ -1123,7 +1136,7 @@ def stop_background_services():
 def run_server():
     """Run the MCP server."""
     # Ensure queue directory exists
-    queue_path = get_queue_file_path()
+    queue_path = _ensure_queue_path_initialized()
     queue_path.parent.mkdir(parents=True, exist_ok=True)
 
     # FastMCP.run() is synchronous and manages its own event loop
