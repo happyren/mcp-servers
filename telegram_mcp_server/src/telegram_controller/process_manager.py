@@ -5,29 +5,25 @@ Includes PID file management for orphan process cleanup after crashes.
 """
 
 import asyncio
-import configparser
 import json
 import logging
 import os
-import re
 import shutil
 import signal
-import socket
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import httpx
 
 from .instance import InstanceState, OpenCodeInstance
+from .project_detector import detect_project_name
+from .pid_manager import PIDManager
+from .port_allocator import PortAllocator
 
 logger = logging.getLogger("telegram_controller.process_manager")
 
-
-# Port range for OpenCode instances
-PORT_RANGE_START = 4097  # Start at 4097, leaving 4096 for current opencode session
-PORT_RANGE_END = 4200
 
 # Health check settings
 HEALTH_CHECK_INTERVAL = 10.0  # seconds
@@ -76,9 +72,9 @@ class ProcessManager:
         self.logs_dir = self.state_dir / "logs"
         self.logs_dir.mkdir(exist_ok=True)
         
-        # PID files directory for orphan cleanup
-        self.pids_dir = self.state_dir / "pids"
-        self.pids_dir.mkdir(exist_ok=True)
+        # Initialize sub-managers
+        self._pid_manager = PIDManager(self.state_dir / "pids")
+        self._port_allocator = PortAllocator()
         
         # Auto-detect opencode binary
         self.opencode_path = opencode_path or self._find_opencode()
@@ -88,9 +84,6 @@ class ProcessManager:
         
         # Active instances by ID
         self.instances: dict[str, OpenCodeInstance] = {}
-        
-        # Port allocation tracking
-        self.used_ports: set[int] = set()
         
         # HTTP client for health checks
         self.http_client: httpx.AsyncClient | None = None
@@ -125,271 +118,11 @@ class ProcessManager:
         logger.warning("opencode binary not found in PATH or common locations")
         return "opencode"
     
-    def _detect_project_name(self, directory: Path) -> str:
-        """Auto-detect a friendly project name from the directory.
-        
-        Tries in order:
-        1. Git repository name (from remote origin URL)
-        2. package.json name field
-        3. pyproject.toml name field
-        4. go.mod module name
-        5. Cargo.toml package name
-        6. Fall back to directory name
-        
-        Args:
-            directory: Project directory
-            
-        Returns:
-            Best-effort project name
-        """
-        # Try git remote origin
-        git_config = directory / ".git" / "config"
-        if git_config.exists():
-            try:
-                config = configparser.ConfigParser()
-                config.read(git_config)
-                
-                # Look for remote "origin" url
-                for section in config.sections():
-                    if section.startswith('remote "') and section.endswith('"'):
-                        url = config.get(section, "url", fallback=None)
-                        if url:
-                            name = self._extract_repo_name_from_url(url)
-                            if name:
-                                logger.debug(f"Detected name from git remote: {name}")
-                                return name
-            except Exception as e:
-                logger.debug(f"Failed to parse git config: {e}")
-        
-        # Try package.json (Node.js)
-        package_json = directory / "package.json"
-        if package_json.exists():
-            try:
-                with open(package_json, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                name = data.get("name")
-                if name and isinstance(name, str):
-                    # Remove scope prefix like @org/name -> name
-                    if name.startswith("@") and "/" in name:
-                        name = name.split("/", 1)[1]
-                    logger.debug(f"Detected name from package.json: {name}")
-                    return name
-            except Exception as e:
-                logger.debug(f"Failed to parse package.json: {e}")
-        
-        # Try pyproject.toml (Python)
-        pyproject = directory / "pyproject.toml"
-        if pyproject.exists():
-            try:
-                # Simple TOML parsing for name field
-                content = pyproject.read_text(encoding="utf-8")
-                # Look for name = "..." under [project] or [tool.poetry]
-                match = re.search(r'^\s*name\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
-                if match:
-                    name = match.group(1)
-                    logger.debug(f"Detected name from pyproject.toml: {name}")
-                    return name
-            except Exception as e:
-                logger.debug(f"Failed to parse pyproject.toml: {e}")
-        
-        # Try go.mod (Go)
-        go_mod = directory / "go.mod"
-        if go_mod.exists():
-            try:
-                content = go_mod.read_text(encoding="utf-8")
-                # module github.com/user/repo
-                match = re.search(r'^module\s+(\S+)', content, re.MULTILINE)
-                if match:
-                    module_path = match.group(1)
-                    # Extract last segment
-                    name = module_path.rsplit("/", 1)[-1]
-                    logger.debug(f"Detected name from go.mod: {name}")
-                    return name
-            except Exception as e:
-                logger.debug(f"Failed to parse go.mod: {e}")
-        
-        # Try Cargo.toml (Rust)
-        cargo_toml = directory / "Cargo.toml"
-        if cargo_toml.exists():
-            try:
-                content = cargo_toml.read_text(encoding="utf-8")
-                match = re.search(r'^\s*name\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
-                if match:
-                    name = match.group(1)
-                    logger.debug(f"Detected name from Cargo.toml: {name}")
-                    return name
-            except Exception as e:
-                logger.debug(f"Failed to parse Cargo.toml: {e}")
-        
-        # Fall back to directory name
-        return directory.name
-    
-    def _extract_repo_name_from_url(self, url: str) -> Optional[str]:
-        """Extract repository name from a git remote URL.
-        
-        Handles:
-        - git@github.com:user/repo.git
-        - https://github.com/user/repo.git
-        - https://github.com/user/repo
-        
-        Args:
-            url: Git remote URL
-            
-        Returns:
-            Repository name or None
-        """
-        # Remove trailing .git
-        url = url.rstrip("/")
-        if url.endswith(".git"):
-            url = url[:-4]
-        
-        # Handle SSH URLs: git@github.com:user/repo
-        if url.startswith("git@") and ":" in url:
-            path = url.split(":", 1)[1]
-            return path.rsplit("/", 1)[-1]
-        
-        # Handle HTTP/HTTPS URLs
-        if "://" in url:
-            path = url.split("://", 1)[1]
-            return path.rsplit("/", 1)[-1]
-        
-        return None
-    
-    def _is_port_available(self, port: int) -> bool:
-        """Check if a port is actually available on the system."""
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(('127.0.0.1', port))
-                return True
-        except OSError:
-            return False
-    
-    def _allocate_port(self) -> int:
-        """Allocate an unused port for a new instance.
-        
-        Scans the port range and checks both internal tracking and actual system availability.
-        """
-        for port in range(PORT_RANGE_START, PORT_RANGE_END):
-            if port in self.used_ports:
-                continue
-            if self._is_port_available(port):
-                self.used_ports.add(port)
-                logger.debug(f"Allocated port {port}")
-                return port
-        raise RuntimeError(f"No available ports in range {PORT_RANGE_START}-{PORT_RANGE_END}")
-    
-    def _release_port(self, port: int) -> None:
-        """Release a port when an instance stops."""
-        self.used_ports.discard(port)
-    
-    def _write_pid_file(self, instance_id: str, pid: int) -> None:
-        """Write PID file for orphan tracking.
-        
-        Args:
-            instance_id: Instance ID
-            pid: Process ID
-        """
-        pid_file = self.pids_dir / f"{instance_id}.pid"
-        try:
-            pid_file.write_text(str(pid), encoding="utf-8")
-            logger.debug(f"Wrote PID file for instance {instance_id[:8]}: {pid}")
-        except Exception as e:
-            logger.error(f"Failed to write PID file for {instance_id[:8]}: {e}")
-    
-    def _remove_pid_file(self, instance_id: str) -> None:
-        """Remove PID file when instance stops.
-        
-        Args:
-            instance_id: Instance ID
-        """
-        pid_file = self.pids_dir / f"{instance_id}.pid"
-        try:
-            if pid_file.exists():
-                pid_file.unlink()
-                logger.debug(f"Removed PID file for instance {instance_id[:8]}")
-        except Exception as e:
-            logger.error(f"Failed to remove PID file for {instance_id[:8]}: {e}")
-    
-    def _is_process_running(self, pid: int) -> bool:
-        """Check if a process is still running.
-        
-        Args:
-            pid: Process ID
-            
-        Returns:
-            True if process exists and is running
-        """
-        try:
-            # Signal 0 checks if process exists without actually sending a signal
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-    
-    def _cleanup_orphan_processes(self) -> int:
-        """Clean up orphan processes from previous crashed sessions.
-        
-        Scans the pids directory for leftover PID files, checks if those
-        processes are still running, and terminates them.
-        
-        Returns:
-            Number of orphan processes cleaned up
-        """
-        cleaned = 0
-        
-        if not self.pids_dir.exists():
-            return 0
-        
-        for pid_file in self.pids_dir.glob("*.pid"):
-            instance_id = pid_file.stem
-            
-            try:
-                pid = int(pid_file.read_text(encoding="utf-8").strip())
-            except (ValueError, OSError) as e:
-                logger.warning(f"Invalid PID file {pid_file.name}: {e}")
-                pid_file.unlink(missing_ok=True)
-                continue
-            
-            # Check if we already have this instance tracked with a process
-            existing = self.instances.get(instance_id)
-            if existing and existing.process and existing.pid == pid:
-                # This is a currently managed instance, skip
-                continue
-            
-            # Check if process is still running
-            if self._is_process_running(pid):
-                logger.warning(f"Found orphan process PID {pid} (instance {instance_id[:8]}), terminating...")
-                try:
-                    # Try graceful termination first
-                    os.kill(pid, signal.SIGTERM)
-                    
-                    # Wait briefly for it to exit
-                    for _ in range(10):  # 1 second total
-                        if not self._is_process_running(pid):
-                            break
-                        import time
-                        time.sleep(0.1)
-                    
-                    # Force kill if still running
-                    if self._is_process_running(pid):
-                        logger.warning(f"Orphan PID {pid} did not exit, force killing")
-                        os.kill(pid, signal.SIGKILL)
-                    
-                    logger.info(f"Cleaned up orphan process PID {pid}")
-                    cleaned += 1
-                except OSError as e:
-                    logger.error(f"Failed to kill orphan PID {pid}: {e}")
-            else:
-                logger.debug(f"PID file {pid_file.name} refers to dead process, cleaning up")
-            
-            # Remove the stale PID file
-            pid_file.unlink(missing_ok=True)
-        
-        if cleaned > 0:
-            logger.info(f"Cleaned up {cleaned} orphan process(es)")
-        
-        return cleaned
+    # Delegate to port allocator
+    @property
+    def used_ports(self) -> set[int]:
+        """Get the set of used ports."""
+        return self._port_allocator.used_ports
     
     def _generate_instance_id(self) -> str:
         """Generate a unique instance ID."""
@@ -413,7 +146,7 @@ class ProcessManager:
                     instance.process = None
                 
                 self.instances[instance.id] = instance
-                self.used_ports.add(instance.port)
+                self._port_allocator.mark_used(instance.port)
             
             logger.info(f"Loaded {len(self.instances)} instances from state file")
         except Exception as e:
@@ -437,7 +170,8 @@ class ProcessManager:
             return
         
         # Clean up any orphan processes from previous crashed sessions
-        self._cleanup_orphan_processes()
+        managed_pids = {inst.pid for inst in self.instances.values() if inst.pid}
+        self._pid_manager.cleanup_orphans(managed_pids)
         
         self._running = True
         self.http_client = httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT)
@@ -505,18 +239,13 @@ class ProcessManager:
         
         # Allocate port
         if port is None:
-            port = self._allocate_port()
+            port = self._port_allocator.allocate()
         else:
-            # Check if specified port is actually available
-            if not self._is_port_available(port):
-                logger.warning(f"Specified port {port} is not available, allocating new port")
-                port = self._allocate_port()
-            elif port not in self.used_ports:
-                self.used_ports.add(port)
+            port = self._port_allocator.allocate_specific(port)
         
         # Auto-detect project name if not provided
         if name is None:
-            name = self._detect_project_name(directory)
+            name = detect_project_name(directory)
         
         # Create instance
         instance = OpenCodeInstance(
@@ -571,7 +300,7 @@ class ProcessManager:
             instance.pid = process.pid
             
             # Write PID file for orphan tracking
-            self._write_pid_file(instance.id, process.pid)
+            self._pid_manager.write_pid(instance.id, process.pid)
             
             self.instances[instance.id] = instance
             self._save_state()
@@ -597,7 +326,7 @@ class ProcessManager:
             
         except Exception as e:
             logger.error(f"Failed to spawn instance: {e}")
-            self._release_port(port)
+            self._port_allocator.release(port)
             instance.state = InstanceState.CRASHED
             instance.error_message = str(e)
             self.instances[instance.id] = instance
@@ -651,8 +380,8 @@ class ProcessManager:
             instance.state = InstanceState.STOPPED
             instance.pid = None
             instance.process = None
-            self._release_port(port)
-            self._remove_pid_file(instance_id)
+            self._port_allocator.release(port)
+            self._pid_manager.remove_pid(instance_id)
             self._save_state()
             return True
         
@@ -690,8 +419,8 @@ class ProcessManager:
             instance.state = InstanceState.STOPPED
             instance.pid = None
             instance.process = None
-            self._release_port(port)
-            self._remove_pid_file(instance_id)
+            self._port_allocator.release(port)
+            self._pid_manager.remove_pid(instance_id)
             self._save_state()
             
             # Wait briefly for port to be released by OS
@@ -700,11 +429,11 @@ class ProcessManager:
             # Verify port is actually released
             max_port_wait = 5.0
             waited = 0.0
-            while waited < max_port_wait and not self._is_port_available(port):
+            while waited < max_port_wait and not PortAllocator.is_port_available(port):
                 await asyncio.sleep(0.5)
                 waited += 0.5
             
-            if not self._is_port_available(port):
+            if not PortAllocator.is_port_available(port):
                 logger.warning(f"Port {port} still in use after stopping instance {instance.short_id}")
             else:
                 logger.info(f"Port {port} released successfully")
@@ -723,8 +452,8 @@ class ProcessManager:
             instance.state = InstanceState.STOPPED
             instance.pid = None
             instance.process = None
-            self._release_port(port)
-            self._remove_pid_file(instance_id)
+            self._port_allocator.release(port)
+            self._pid_manager.remove_pid(instance_id)
             self._save_state()
             return False
     
@@ -761,8 +490,8 @@ class ProcessManager:
         instance.restart_count += 1
         
         # Determine port to use - try old port first, allocate new if in use
-        port_to_use = None
-        if self._is_port_available(old_port):
+        port_to_use: Optional[int] = None
+        if PortAllocator.is_port_available(old_port):
             port_to_use = old_port
             logger.info(f"Reusing port {old_port} for restart")
         else:
@@ -771,7 +500,7 @@ class ProcessManager:
         
         # Remove old instance
         del self.instances[instance_id]
-        self._release_port(old_port)  # Make sure it's released from tracking
+        self._port_allocator.release(old_port)
         
         try:
             # Respawn with new or same port
@@ -805,8 +534,8 @@ class ProcessManager:
             await self.stop_instance(instance_id)
         
         # Release port and remove PID file
-        self._release_port(instance.port)
-        self._remove_pid_file(instance_id)
+        self._port_allocator.release(instance.port)
+        self._pid_manager.remove_pid(instance_id)
         
         # Remove from tracking
         del self.instances[instance_id]
@@ -839,7 +568,7 @@ class ProcessManager:
                 instance.state = InstanceState.CRASHED
                 instance.error_message = f"Process exited with code {instance.process.returncode}"
                 instance.pid = None
-                self._remove_pid_file(instance.id)
+                self._pid_manager.remove_pid(instance.id)
                 logger.warning(f"Instance {instance.short_id} crashed")
                 
                 if self.auto_restart and instance.restart_count < 3:

@@ -941,47 +941,7 @@ class TelegramClient:
             is_read=False,
         )
         return True
-    
-    async def set_my_commands(
-        self,
-        commands: list[dict[str, str]],
-        scope: dict[str, Any] | None = None,
-        language_code: str | None = None,
-    ) -> bool:
-        """Set the list of bot commands.
-        
-        Args:
-            commands: List of {"command": "...", "description": "..."} dicts
-            scope: Optional scope (e.g., for specific chats)
-            language_code: Optional language code
-            
-        Returns:
-            True on success
-        """
-        params: dict[str, Any] = {"commands": commands}
-        if scope:
-            params["scope"] = scope
-        if language_code:
-            params["language_code"] = language_code
-        
-        await self._request_with_retry("setMyCommands", params, is_read=False)
-        return True
-    
-    async def get_chat(self, chat_id: str | int) -> dict[str, Any]:
-        """Get up-to-date information about a chat.
-        
-        Args:
-            chat_id: The chat ID
-            
-        Returns:
-            ChatFullInfo object
-        """
-        return await self._request_with_retry(
-            "getChat",
-            {"chat_id": chat_id},
-            is_read=True,
-        )
-    
+
     async def send_message_to_topic(
         self,
         chat_id: str | int,
