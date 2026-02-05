@@ -156,12 +156,14 @@ class QuantCodeInstanceFactory(InstanceFactory):
         # Check if there's a custom server script
         custom_script = config.get("script_path")
         if custom_script:
-            return [server_path, custom_script, "--http-port", str(port)]
+            return [server_path, custom_script, "--http-only", "--http-port", str(port)]
         
-        # Default: run as Python module
+        # Default: run as Python module in HTTP-only mode
         return [
             server_path,
             "-m", module,
+            "--http-only",
+            "--http-port", str(port),
         ]
     
     def get_env_vars(self, config: Dict[str, Any]) -> Dict[str, str]:
