@@ -117,7 +117,7 @@ class OpenCodeInstanceFactory(InstanceFactory):
         """
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(f"{instance.url}/api/health")
+                resp = await client.get(f"{instance.url}/global/health")
                 if resp.status_code == 200:
                     instance.last_health_check = datetime.now()
                     instance.health_check_failures = 0
@@ -140,18 +140,15 @@ class OpenCodeInstanceFactory(InstanceFactory):
         Returns:
             Command as list of strings
         """
-        provider_id = config.get("provider_id", DEFAULT_PROVIDER)
-        model_id = config.get("model_id", DEFAULT_MODEL)
-        
         cmd = [
             "opencode",
-            "--http-port", str(port),
-            "--provider", provider_id,
-            "--model", model_id,
+            "serve",
+            "--port", str(port),
+            "--hostname", "127.0.0.1",
         ]
         
-        if config.get("no_browser", True):
-            cmd.append("--no-browser")
+        # Note: provider_id and model_id are passed via environment variables
+        # or global opencode configuration
         
         return cmd
     
@@ -169,6 +166,12 @@ class OpenCodeInstanceFactory(InstanceFactory):
         # Pass through API keys if configured
         if "api_key" in config:
             env["OPENCODE_API_KEY"] = config["api_key"]
+        
+        # Pass provider and model if configured (opencode may read these)
+        if "provider_id" in config:
+            env["OPENCODE_PROVIDER"] = config["provider_id"]
+        if "model_id" in config:
+            env["OPENCODE_MODEL"] = config["model_id"]
         
         return env
 
