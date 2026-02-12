@@ -9,6 +9,21 @@ This guide is designed to be read by an AI agent to configure the Telegram MCP S
 Before starting, the user must provide:
 1. **Telegram Bot Token** - Obtained from @BotFather on Telegram
 2. **Chat ID** - The user's Telegram user ID (obtained from @userinfobot)
+3. **OpenCode v1.1.56+** - Ensure OpenCode is installed and updated to at least version 1.1.56
+
+### OpenCode Version Compatibility
+- **v1.1.56+**: Uses `opencode serve` command for headless HTTP server mode
+- **Older versions**: May require patching the `OpenCodeInstanceFactory` to use deprecated `--http-port` flag
+
+Check your OpenCode version:
+```bash
+opencode --version
+```
+
+Update OpenCode if needed:
+```bash
+opencode upgrade
+```
 
 If the user hasn't created a bot yet, instruct them to:
 1. Open Telegram and search for `@BotFather`
